@@ -2,7 +2,7 @@
 # ============================================================================
 # GPU Server Script for CED Phase 0
 # Run on GPU server (NO internet, 8x H200, shared filesystem with CPU server)
-# Creates conda env from local packages, then runs P0 experiments
+# Activates conda env from shared path, installs from local wheels, runs P0
 # ============================================================================
 
 set -e
@@ -11,6 +11,7 @@ BASE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangman
 CODE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/code"
 OUTPUT_DIR="${CODE_DIR}/results_p0"
 
+ENV_DIR="${BASE_DIR}/conda_envs/ced_p0"
 MODEL_PATH="${BASE_DIR}/models/Qwen2.5-VL-7B-Instruct"
 COCO_IMG_DIR="${BASE_DIR}/data/coco/images/val2017"
 COCO_ANN_FILE="${BASE_DIR}/data/coco/annotations/instances_val2017.json"
@@ -24,83 +25,112 @@ echo "============================================"
 # Pre-flight checks
 # -------------------------------------------------------------------
 echo "[0] Pre-flight checks..."
-if [ ! -f "${MODEL_PATH}/config.json" ]; then
-    echo "ERROR: Model not found at ${MODEL_PATH}. Run cpu.sh first."
-    exit 1
-fi
-if [ ! -f "${COCO_ANN_FILE}" ]; then
-    echo "ERROR: COCO annotations not found. Run cpu.sh first."
-    exit 1
-fi
-if [ ! -d "${PACKAGES_DIR}" ]; then
-    echo "ERROR: Pip packages not found at ${PACKAGES_DIR}. Run cpu.sh first."
-    exit 1
-fi
+
+check_path() {
+    if [ ! -e "$1" ]; then
+        echo "ERROR: $2 not found at $1"
+        echo "       Please run cpu.sh on the CPU server first."
+        exit 1
+    fi
+    echo "  OK: $2"
+}
+
+check_path "${ENV_DIR}/bin/python"   "Conda environment"
+check_path "${MODEL_PATH}/config.json" "Model weights"
+check_path "${COCO_ANN_FILE}"         "COCO annotations"
+check_path "${PACKAGES_DIR}"          "Pip packages"
 
 # -------------------------------------------------------------------
-# Step 1: Create conda environment
+# Step 1: Activate conda environment via prefix path
 # -------------------------------------------------------------------
-echo "[1/3] Setting up conda environment..."
+echo ""
+echo "[1/3] Activating conda environment..."
 
 # Initialize conda
-eval "$(conda shell.bash hook)"
-
-# Create or reuse env
-if conda env list | grep -q "ced_p0"; then
-    echo "Conda env ced_p0 exists, activating..."
+__conda_setup="$('conda' 'shell.bash' 'hook' 2>/dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
 else
-    echo "Creating conda env ced_p0 with python 3.10.0..."
-    conda create -n ced_p0 python=3.10.0 -y
+    CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")
+    if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+        source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    else
+        echo "ERROR: Cannot initialize conda."
+        exit 1
+    fi
 fi
-conda activate ced_p0
+
+# Activate via full prefix path (no need for env name lookup)
+conda activate "${ENV_DIR}"
+echo "  Python: $(which python) -> $(python --version)"
 
 # -------------------------------------------------------------------
-# Step 2: Install packages from local wheels (offline)
+# Step 2: Install packages from local wheels (fully offline)
 # -------------------------------------------------------------------
-echo "[2/3] Installing packages from local cache..."
+echo ""
+echo "[2/3] Installing packages from local cache (offline)..."
 
-# Install torch first (CUDA 12.4)
+# PyTorch (CUDA 12.4)
 pip install --no-index --find-links="${PACKAGES_DIR}" \
-    torch==2.5.1 torchvision==0.20.1 2>/dev/null || \
+    torch==2.5.1 torchvision==0.20.1 \
+    2>/dev/null || \
 pip install --no-index --find-links="${PACKAGES_DIR}" \
     torch torchvision
 
-# Install transformers stack
+# Transformers ecosystem
 pip install --no-index --find-links="${PACKAGES_DIR}" \
-    transformers accelerate qwen-vl-utils huggingface-hub \
-    safetensors tokenizers sentencepiece av
+    transformers==4.48.3 \
+    accelerate==1.3.0 \
+    qwen-vl-utils==0.0.10 \
+    huggingface-hub==0.27.1 \
+    safetensors==0.5.2 \
+    tokenizers==0.21.0 \
+    sentencepiece==0.2.0 \
+    av==14.1.0
 
-# Install scientific packages
+# Scientific stack
 pip install --no-index --find-links="${PACKAGES_DIR}" \
-    numpy scipy scikit-learn matplotlib seaborn \
-    Pillow pycocotools tqdm pandas
+    numpy==1.26.4 \
+    scipy==1.14.1 \
+    scikit-learn==1.6.1 \
+    matplotlib==3.9.4 \
+    seaborn==0.13.2 \
+    Pillow==11.1.0 \
+    pycocotools==2.0.8 \
+    tqdm==4.67.1 \
+    pandas==2.2.3
 
-echo "Package installation complete."
-
-# Verify key packages
+echo ""
+echo "  Package verification:"
 python -c "
 import torch
-print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPUs: {torch.cuda.device_count()}')
+print(f'  PyTorch {torch.__version__}  CUDA={torch.cuda.is_available()}  GPUs={torch.cuda.device_count()}')
 import transformers
-print(f'Transformers: {transformers.__version__}')
-" || { echo "ERROR: Package verification failed"; exit 1; }
+print(f'  Transformers {transformers.__version__}')
+import numpy, scipy, sklearn, matplotlib, PIL
+print(f'  NumPy={numpy.__version__} SciPy={scipy.__version__} sklearn={sklearn.__version__}')
+print(f'  Matplotlib={matplotlib.__version__} Pillow={PIL.__version__}')
+" || { echo "ERROR: Package verification failed!"; exit 1; }
 
 # -------------------------------------------------------------------
 # Step 3: Run Phase 0 Experiments
 # -------------------------------------------------------------------
+echo ""
 echo "[3/3] Running CED Phase 0 experiments..."
 
 mkdir -p "${OUTPUT_DIR}"
-
 cd "${CODE_DIR}"
 
-# Set environment variables
+# Offline mode for HuggingFace
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=0  # P0 only needs single GPU
+export HF_HUB_OFFLINE=1
+
+# Single GPU is sufficient for P0
+export CUDA_VISIBLE_DEVICES=0
 
 echo ""
-echo "=== P0-a: Architecture Probing ==="
+echo "========== P0-a: Architecture Probing =========="
 python main.py \
     --mode probe \
     --model_path "${MODEL_PATH}" \
@@ -110,7 +140,7 @@ python main.py \
     2>&1 | tee "${OUTPUT_DIR}/log_p0a.txt"
 
 echo ""
-echo "=== P0-b: CED Signal Validation ==="
+echo "========== P0-b: CED Signal Validation =========="
 python main.py \
     --mode validate \
     --model_path "${MODEL_PATH}" \
@@ -122,17 +152,19 @@ python main.py \
     --lambda_e_values 0.0 0.05 0.1 0.2 0.3 0.5 \
     2>&1 | tee "${OUTPUT_DIR}/log_p0b.txt"
 
+# -------------------------------------------------------------------
+# Done
+# -------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "Phase 0 experiments complete!"
-echo "Results saved to: ${OUTPUT_DIR}/"
+echo "Phase 0 complete!"
 echo "============================================"
+echo "Results:  ${OUTPUT_DIR}/"
 echo ""
-echo "Key output files:"
-ls -la "${OUTPUT_DIR}/"
+echo "Key files:"
+ls -lh "${OUTPUT_DIR}/"*.json "${OUTPUT_DIR}/"*.png 2>/dev/null || echo "(check ${OUTPUT_DIR}/)"
 echo ""
-echo "Check log files for detailed results:"
+echo "Logs:"
 echo "  P0-a: ${OUTPUT_DIR}/log_p0a.txt"
 echo "  P0-b: ${OUTPUT_DIR}/log_p0b.txt"
-echo "  Results JSON: ${OUTPUT_DIR}/ced_results.json"
-echo "  Figures: ${OUTPUT_DIR}/*.png"
+echo "============================================"
