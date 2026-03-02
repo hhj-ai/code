@@ -19,8 +19,11 @@ add_lib_dir () {
     fi
   fi
 }
+# conda env libs
 add_lib_dir "$CED_ENV/lib"
+# torch bundled libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/torch/lib"
+# pip nvidia libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/nvjitlink/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cusparse/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cublas/lib"
@@ -28,7 +31,7 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
 
-    # ✅ HF 缓存建议放到项目目录（可控、可迁移）
+    # ✅ HF 缓存放到项目目录（可控）
     export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
     export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
     export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"

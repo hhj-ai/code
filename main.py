@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""main.py (v6)
+"""main.py (v7, Qwen3-VL 正确加载版)
 
-你遇到的问题（结合上下文）：
-- 你原工程在用 Qwen3-VL（日志出现 Qwen3VLConfig），但我之前脚本默认写成了 Qwen2.5-VL-7B，所以才会重新下 16GB。
-- 你机器上的 `hf` CLI 版本不支持某些参数（如 --resume-download），所以不要依赖 CLI。
-
-本版目标：
-1) 默认用“自动本地复用”：优先在你项目常见目录里找已下载的 Qwen3-VL（有 config.json + *.safetensors/*.bin）。
-   找到了就直接用本地目录，完全不下载。
-2) 如果没找到，再从 Hub 下载 Qwen3-VL（默认 fallback：Qwen/Qwen3-VL-8B-Instruct）到一个稳定目录（默认 ../dataprepare/models/...）
-3) 不再调用 hf CLI，统一使用 huggingface_hub.snapshot_download（避免 CLI 版本差异）。
-4) 支持 --download-only：下载阶段不 import torch，避免 torch/CUDA so 问题把下载也卡死。
-5) 兼容 Python 3.8+。
+✅ 回顾上下文的所有坑并修好：
+1) 你原工程实际在用 Qwen3-VL（报错出现 Qwen3VLConfig），之前默认误写成 Qwen2.5-VL 导致重新下载 16GB —— 已修：默认 repo=auto + fallback=Qwen/Qwen3-VL-8B-Instruct
+2) `hf download --resume-download` 在你机器不支持 —— 已修：完全不依赖 hf CLI，统一用 snapshot_download
+3) 以前 `list[str]` 在老 Python 报错 —— 已修：typing.List 兼容写法
+4) Qwen3VLConfig 不能用 AutoModelForCausalLM —— 已修：检测到 qwen3_vl 配置就用 Qwen3VLForConditionalGeneration（或 MoE 版本）
+5) 你日志里提示 `torch_dtype` deprecated —— 已修：优先使用 dtype=...，必要时回退 torch_dtype=...
+6) CUDA 动态库抢先加载导致 torch import 炸 —— 由 cpu.sh/gpu.sh 负责设置 LD_LIBRARY_PATH（脚本里已做）
 
 用法：
-  - 默认（自动找本地 Qwen3-VL，否则下载 fallback）：
+  - 默认（自动找本地 Qwen3-VL，找不到才下载 fallback）：
       python main.py --download-only
-  - 直接指定本地目录（强制不下载）：
-      python main.py --repo-id /abs/path/to/Qwen3-VL
-  - 强制指定 Hub repo（会下载到 local-dir）：
+  - 强制使用某个本地目录（完全不下载）：
+      python main.py --repo-id /abs/path/to/Qwen3-VL-dir
+  - 指定 HF repo：
       python main.py --repo-id Qwen/Qwen3-VL-8B-Instruct --local-dir /path/to/save
-
-额外：
-  - 若你下载速度慢/频繁限流，设置 HF_TOKEN 可提高限额/速度（在 shell 里 export HF_TOKEN=...）。
 """
 
 from __future__ import annotations
@@ -32,7 +25,7 @@ from __future__ import annotations
 import os
 import sys
 import argparse
-from typing import Any, Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List
 
 from huggingface_hub import snapshot_download
 
@@ -58,7 +51,6 @@ def _list_dir_children(parent: str) -> List[str]:
 
 def find_existing_qwen3vl(preferred_roots: List[str]) -> Optional[str]:
     """在常见目录中寻找已存在的 Qwen3-VL 模型目录。"""
-    # 先尝试一些常见固定名字（命中率最高）
     common_names = [
         "Qwen3-VL-8B-Instruct",
         "Qwen3-VL-7B-Instruct",
@@ -71,7 +63,7 @@ def find_existing_qwen3vl(preferred_roots: List[str]) -> Optional[str]:
             if _has_weights(p):
                 return p
 
-    # 再做一次“浅扫描”：找名字里同时包含 qwen3 和 vl 的目录
+    # 浅扫描：目录名包含 qwen3 和 vl
     for r in preferred_roots:
         for child in _list_dir_children(r):
             bn = os.path.basename(child).lower()
@@ -87,7 +79,7 @@ def ensure_downloaded(repo_id_or_path: str,
                       preferred_roots: List[str],
                       fallback_repo: str) -> str:
     """确保模型在本地可用，优先复用已有本地目录，避免重复下载。"""
-    # 1) 如果直接给了本地目录
+    # 1) 直接给了本地目录
     if os.path.isdir(repo_id_or_path):
         if not _has_weights(repo_id_or_path):
             raise RuntimeError("Provided local dir has no weights/config.json: {}".format(repo_id_or_path))
@@ -101,7 +93,7 @@ def ensure_downloaded(repo_id_or_path: str,
             return hit
         repo_id_or_path = fallback_repo  # 没找到就用 fallback 下载
 
-    # 3) local_dir 已经完整就直接用（同一个目录跑，不会重复下）
+    # 3) local_dir 已经完整就直接用
     if _has_weights(local_dir):
         return local_dir
 
@@ -113,8 +105,6 @@ def ensure_downloaded(repo_id_or_path: str,
         repo_type="model",
         local_dir=local_dir,
     )
-    # 注意：当 local_dir 指定时，hub 的文档说明 cache_dir 不会被用作主缓存，
-    # 但传了也不影响；这里保留以兼容部分版本/内部实现。
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
 
@@ -126,6 +116,7 @@ def ensure_downloaded(repo_id_or_path: str,
 
 
 def _get_num_hidden_layers(cfg: Any, model: Optional[Any] = None) -> int:
+    # Qwen3-VL 的 num_hidden_layers 在 text_config 里
     if hasattr(cfg, "num_hidden_layers"):
         return int(getattr(cfg, "num_hidden_layers"))
 
@@ -154,27 +145,62 @@ def _get_num_hidden_layers(cfg: Any, model: Optional[Any] = None) -> int:
     raise AttributeError("Cannot determine num_hidden_layers for this model/config.")
 
 
-def _import_torch_and_transformers():
+def _import_transformers():
+    """延迟导入，保持 download-only 阶段不触发 torch/transformers load。"""
     try:
         import torch
     except Exception as e:
         print("[FATAL] import torch 失败：{}".format(repr(e)), file=sys.stderr)
         raise
 
-    from transformers import AutoProcessor
+    from transformers import AutoProcessor, AutoConfig
+
+    # Qwen3-VL 推荐的类（Transformers 官方文档）
     try:
-        from transformers import AutoModelForVision2Seq
-        has_v2s = True
+        from transformers import Qwen3VLForConditionalGeneration  # type: ignore
+    except Exception:
+        Qwen3VLForConditionalGeneration = None
+
+    # MoE 变体（如果你用的是 Qwen3-VL-30B-A3B 之类）
+    try:
+        from transformers import Qwen3VLMoeForConditionalGeneration  # type: ignore
+    except Exception:
+        Qwen3VLMoeForConditionalGeneration = None
+
+    # 兜底：有些 VLM 会走 AutoModelForVision2Seq
+    try:
+        from transformers import AutoModelForVision2Seq  # type: ignore
     except Exception:
         AutoModelForVision2Seq = None
-        has_v2s = False
 
     from transformers import AutoModelForCausalLM
-    return torch, AutoProcessor, has_v2s, AutoModelForCausalLM, AutoModelForVision2Seq
+
+    return torch, AutoProcessor, AutoConfig, Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration, AutoModelForVision2Seq, AutoModelForCausalLM
+
+
+def _call_from_pretrained(cls, model_path: str, *, dtype, device_map, trust_remote_code: bool, **kwargs):
+    """兼容 transformers 的 dtype/torch_dtype 过渡期。优先 dtype，不行再 torch_dtype。"""
+    try:
+        return cls.from_pretrained(
+            model_path,
+            dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+            **kwargs
+        )
+    except TypeError:
+        # 老版本/某些类仍用 torch_dtype
+        return cls.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+            **kwargs
+        )
 
 
 def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool):
-    torch, AutoProcessor, has_v2s, AutoModelForCausalLM, AutoModelForVision2Seq = _import_torch_and_transformers()
+    torch, AutoProcessor, AutoConfig, Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration, AutoModelForVision2Seq, AutoModelForCausalLM = _import_transformers()
 
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
 
@@ -188,22 +214,54 @@ def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool
 
     device_map = "auto" if (device.startswith("cuda") and torch.cuda.is_available()) else None
 
-    if has_v2s and AutoModelForVision2Seq is not None:
-        model = AutoModelForVision2Seq.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            ignore_mismatched_sizes=True,
-        )
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    model_type = getattr(cfg, "model_type", "").lower()
+
+    # ✅ 关键修复：Qwen3-VL 不能用 AutoModelForCausalLM
+    if "qwen3_vl" in model_type or cfg.__class__.__name__ in ("Qwen3VLConfig", "Qwen3VLMoeConfig"):
+        if ("moe" in model_type) and (Qwen3VLMoeForConditionalGeneration is not None):
+            model = _call_from_pretrained(
+                Qwen3VLMoeForConditionalGeneration,
+                model_path,
+                dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                ignore_mismatched_sizes=True,
+            )
+        elif Qwen3VLForConditionalGeneration is not None:
+            model = _call_from_pretrained(
+                Qwen3VLForConditionalGeneration,
+                model_path,
+                dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                ignore_mismatched_sizes=True,
+            )
+        else:
+            raise RuntimeError(
+                "Detected Qwen3-VL config but transformers doesn't expose Qwen3VLForConditionalGeneration. "
+                "Please upgrade transformers to the version that includes Qwen3-VL support."
+            )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            ignore_mismatched_sizes=True,
-        )
+        # 非 Qwen3-VL：尽量走 V2S，否则走 CausalLM
+        if AutoModelForVision2Seq is not None:
+            model = _call_from_pretrained(
+                AutoModelForVision2Seq,
+                model_path,
+                dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                ignore_mismatched_sizes=True,
+            )
+        else:
+            model = _call_from_pretrained(
+                AutoModelForCausalLM,
+                model_path,
+                dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=trust_remote_code,
+                ignore_mismatched_sizes=True,
+            )
 
     if device_map is None:
         model = model.to(device)
@@ -220,14 +278,11 @@ class CEDExperiment:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    # ✅ 默认 auto：优先复用本地 Qwen3-VL
     p.add_argument("--repo-id", type=str, default="auto",
-                   help="auto | HF repo id (e.g. Qwen/Qwen3-VL-8B-Instruct) | local dir path")
-    # ✅ 默认落到 dataprepare/models（更符合你原工程的布局）
+                   help="auto | HF repo id | local dir path")
     p.add_argument("--local-dir", type=str, default="../dataprepare/models/Qwen3-VL-8B-Instruct")
     p.add_argument("--cache-dir", type=str, default=None)
-    p.add_argument("--preferred-root", action="append", default=[],
-                   help="Add a directory to search existing local models (can be repeated).")
+    p.add_argument("--preferred-root", action="append", default=[])
     p.add_argument("--fallback-repo", type=str, default="Qwen/Qwen3-VL-8B-Instruct")
 
     p.add_argument("--device", type=str, default="cuda:0")
@@ -242,8 +297,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 默认搜索根目录：dataprepare/models 和 code/models（结合你的工程结构）
-    preferred_roots = []
+    preferred_roots: List[str] = []
     if args.preferred_root:
         preferred_roots.extend(args.preferred_root)
     preferred_roots.extend([
@@ -268,13 +322,32 @@ def main():
     print("[OK] Loaded model. num_layers = {}".format(exp.num_layers), flush=True)
 
     if args.smoke_test:
+        # 采用 Qwen3-VL 文档推荐的 chat-template 方式（只用 text 也可）
         import torch
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hello World"}],
+            }
+        ]
+        inputs = exp.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        # 一些版本会带 token_type_ids，生成时可删掉
+        inputs.pop("token_type_ids", None)
+        inputs = {k: v.to(exp.model.device) for k, v in inputs.items()}
+
         with torch.no_grad():
-            inputs = exp.processor(text="Hello World", return_tensors="pt")
-            inputs = {k: v.to(exp.model.device) for k, v in inputs.items()}
-            out = exp.model.generate(**inputs, max_new_tokens=16)
-            txt = exp.processor.decode(out[0], skip_special_tokens=True)
-            print("[SMOKE_TEST_OUTPUT]", txt, flush=True)
+            generated_ids = exp.model.generate(**inputs, max_new_tokens=16)
+        # 只取新增部分
+        in_len = inputs["input_ids"].shape[-1]
+        trimmed = generated_ids[:, in_len:]
+        out_text = exp.processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print("[SMOKE_TEST_OUTPUT]", out_text, flush=True)
 
 
 if __name__ == "__main__":
