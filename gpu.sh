@@ -2,32 +2,24 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# gpu.sh (v11)
-# 默认：跑“整个数据集”并产出结果（predictions.jsonl + summary.json）
+# gpu.sh (v12)
+# 和 cpu.sh 对齐：
+# - 同一个 CED_ENV / HF_HOME / CACHE 变量逻辑
+# - 先用 main.py --download-only 解析本地模型路径（不触网）
+# - 默认跑“整数据集”，但只在 dataprepare/data 与 dataprepare/datasets 下自动发现
+#   （避免误选 conda env / site-packages 里的乱七八糟 json）
 #
-# ✅ GPU 机无网：强制离线 + 只用本地模型/数据
-# ✅ 仍保留：
-#    - --smoke：只验活（加载+短生成）
-#    - 自定义命令：bash gpu.sh python xxx.py --model_path {MODEL_PATH} ...
-#
-# 默认数据集定位：
-#   1) 你显式传入：DATA_PATH=/path/to/data.jsonl bash gpu.sh
-#   2) 或者：bash gpu.sh --data /path/to/data.jsonl
-#   3) 都不传：自动在 ../dataprepare/data / ../dataprepare/datasets 等位置找最新的 *.jsonl/*.json
-#
-# 默认输出：
-#   ./logs/dataset_run_<ts>/predictions.jsonl
-#   ./logs/dataset_run_<ts>/summary.json
+# 用法：
+#   bash gpu.sh                      # 默认：自动发现数据集 + 全量跑
+#   bash gpu.sh --data /path/a.jsonl # 指定数据集
+#   bash gpu.sh --smoke              # 只验活（加载+短生成）
+#   bash gpu.sh --exec -- <cmd ...>  # 执行自定义命令（支持 {MODEL_PATH} 占位符）
 # ------------------------------------------------------------
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CED_ENV="${CED_ENV:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0}"
 PY="${PYTHON_BIN:-$CED_ENV/bin/python}"
-
 if [ ! -x "$PY" ]; then
   echo "[FATAL] Python not found: $PY" >&2
-  echo "        先在 CPU 机把 conda env 建好/装好包，然后 GPU 机再跑本脚本。" >&2
   exit 1
 fi
 
@@ -47,46 +39,36 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cublas/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
-# ---- HF 离线缓存 + 强制离线 ----
-export HF_HOME="${HF_HOME:-$SCRIPT_DIR/.hf_home}"
+# ✅ 与 cpu.sh 对齐：HF_HOME 默认用当前目录
+export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 
+# GPU 无网：强制离线（避免卡住）
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 
 MODEL_ID="${MODEL_ID:-auto}"
-LOCAL_DIR="${LOCAL_DIR:-$SCRIPT_DIR/../dataprepare/models/Qwen3-VL-8B-Instruct}"
+LOCAL_DIR="${LOCAL_DIR:-$PWD/../dataprepare/models/Qwen3-VL-8B-Instruct}"
 CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
 FALLBACK_REPO="${FALLBACK_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
 
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-auto}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
+TEMPERATURE="${TEMPERATURE:-0.0}"
 
-mkdir -p "$SCRIPT_DIR/logs"
+# 日志目录
+mkdir -p "$PWD/logs"
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="$SCRIPT_DIR/logs/gpu_${TS}.log"
+LOG="$PWD/logs/gpu_${TS}.log"
 
 # -----------------------------
-# 解析参数：--smoke / --data
-# -----------------------------
-SMOKE=0
-DATA_ARG=""
-if [ "${1:-}" = "--smoke" ]; then
-  SMOKE=1
-  shift
-fi
-if [ "${1:-}" = "--data" ]; then
-  DATA_ARG="${2:-}"
-  shift 2 || true
-fi
-
-# -----------------------------
-# 定位本地模型（不触网）
+# 解析本地模型路径（不加载权重）
 # -----------------------------
 echo "[INFO] Resolving local model path..." | tee -a "$LOG"
-RESOLVE_OUT="$("$PY" -u "$SCRIPT_DIR/main.py" \
+RESOLVE_OUT="$("$PY" -u main.py \
   --repo-id "$MODEL_ID" \
   --local-dir "$LOCAL_DIR" \
   --cache-dir "$CACHE_DIR" \
@@ -95,19 +77,38 @@ RESOLVE_OUT="$("$PY" -u "$SCRIPT_DIR/main.py" \
 
 MODEL_PATH="$(echo "$RESOLVE_OUT" | sed -n 's/^\[OK\] Model ready at: //p' | tail -n 1)"
 if [ -z "${MODEL_PATH:-}" ]; then
-  echo "[FATAL] Failed to parse model path from main.py output. See log: $LOG" >&2
-  echo "        常见原因：GPU 机没有本地模型（CPU 机没提前下载）" >&2
+  echo "[FATAL] Failed to parse model path from main.py output. See: $LOG" >&2
   exit 2
 fi
 export CED_MODEL_PATH="$MODEL_PATH"
 echo "[OK] CED_MODEL_PATH=$CED_MODEL_PATH" | tee -a "$LOG"
 
 # -----------------------------
-# Smoke test：加载 + 短生成
+# 参数解析
 # -----------------------------
-if [ "$SMOKE" -eq 1 ]; then
-  echo "[INFO] Running smoke test (load + short generation) ..." | tee -a "$LOG"
-  "$PY" -u "$SCRIPT_DIR/main.py" \
+DATA_PATH="${DATA_PATH:-}"
+MODE="full"
+
+# 允许：gpu.sh --data xxx
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --data)
+      DATA_PATH="$2"; shift 2;;
+    --smoke)
+      MODE="smoke"; shift;;
+    --exec)
+      MODE="exec"; shift; break;;
+    --)
+      shift; break;;
+    *)
+      # 兼容：用户直接传命令 => exec 模式
+      MODE="exec"; break;;
+  esac
+done
+
+if [ "$MODE" = "smoke" ]; then
+  echo "[INFO] Running smoke test (load + short generation)..." | tee -a "$LOG"
+  "$PY" -u main.py \
     --repo-id "$MODEL_ID" \
     --local-dir "$LOCAL_DIR" \
     --cache-dir "$CACHE_DIR" \
@@ -119,10 +120,8 @@ if [ "$SMOKE" -eq 1 ]; then
   exit 0
 fi
 
-# -----------------------------
-# 自定义命令模式：bash gpu.sh python xxx.py ...
-# -----------------------------
-if [ "$#" -gt 0 ]; then
+if [ "$MODE" = "exec" ]; then
+  # 自定义命令（支持 {MODEL_PATH} 占位符）
   cmd=( "$@" )
   for i in "${!cmd[@]}"; do
     cmd[$i]="${cmd[$i]//\{MODEL_PATH\}/$CED_MODEL_PATH}"
@@ -135,35 +134,40 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # -----------------------------
-# 默认：跑“整个数据集”
+# 默认：跑整数据集
 # -----------------------------
-RUN_DIR="${RUN_DIR:-$SCRIPT_DIR/logs/dataset_run_${TS}}"
+RUN_DIR="$PWD/logs/dataset_run_${TS}"
 mkdir -p "$RUN_DIR"
-OUT_PRED="${OUT_PRED:-$RUN_DIR/predictions.jsonl}"
-OUT_SUMMARY="${OUT_SUMMARY:-$RUN_DIR/summary.json}"
+OUT_PRED="$RUN_DIR/predictions.jsonl"
+OUT_SUM="$RUN_DIR/summary.json"
 
-DATA_PATH="${DATA_PATH:-$DATA_ARG}"
+# 默认只在这两个目录里自动发现，避免误选 conda env/site-packages
+DEFAULT_DATA_ROOTS=(
+  "$PWD/../dataprepare/data"
+  "$PWD/../dataprepare/datasets"
+)
 
-echo "[INFO] Default: run full dataset" | tee -a "$LOG"
-echo "[INFO] RUN_DIR=$RUN_DIR" | tee -a "$LOG"
-echo "[INFO] OUT_PRED=$OUT_PRED" | tee -a "$LOG"
-echo "[INFO] OUT_SUMMARY=$OUT_SUMMARY" | tee -a "$LOG"
-if [ -n "${DATA_PATH:-}" ]; then
-  echo "[INFO] DATA_PATH (explicit) = $DATA_PATH" | tee -a "$LOG"
+ARGS=( "--model_path" "$CED_MODEL_PATH"
+       "--device" "$DEVICE"
+       "--dtype" "$DTYPE"
+       "--max_new_tokens" "$MAX_NEW_TOKENS"
+       "--temperature" "$TEMPERATURE"
+       "--out_pred" "$OUT_PRED"
+       "--out_summary" "$OUT_SUM" )
+
+if [ -n "$DATA_PATH" ]; then
+  ARGS+=( "--data" "$DATA_PATH" )
 else
-  echo "[INFO] DATA_PATH not provided. Will auto-discover dataset under ../dataprepare/ ..." | tee -a "$LOG"
+  # 传给脚本：只搜索这些 roots
+  for r in "${DEFAULT_DATA_ROOTS[@]}"; do
+    ARGS+=( "--data_root" "$r" )
+  done
 fi
 
-"$PY" -u "$SCRIPT_DIR/run_full_dataset.py" \
-  --model_path "$CED_MODEL_PATH" \
-  --device "$DEVICE" \
-  --dtype "$DTYPE" \
-  ${DATA_PATH:+ --data "$DATA_PATH"} \
-  --out_pred "$OUT_PRED" \
-  --out_summary "$OUT_SUMMARY" \
-  2>&1 | tee -a "$LOG"
+echo "[INFO] Running full dataset evaluation..." | tee -a "$LOG"
+"$PY" -u run_full_dataset.py "${ARGS[@]}" 2>&1 | tee -a "$LOG"
 
 echo "[DONE] dataset run ok."
-echo "       summary : $OUT_SUMMARY"
+echo "       summary : $OUT_SUM"
 echo "       preds   : $OUT_PRED"
 echo "       log     : $LOG"
