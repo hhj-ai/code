@@ -29,8 +29,8 @@ HF_CACHE_DIR="${BASE_DIR}/.hf_cache"
 # Model selection (Qwen3-VL)
 # ----------------------------
 # Default to 8B to keep download/runtime reasonable; override if you want.
-MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
-MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
+export MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
+export MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
 
 # ----------------------------
 # Force OFFICIAL PyPI
