@@ -1,19 +1,25 @@
 #!/bin/bash
-# ============================================================================
-# cpu.sh (CPU has internet) - Qwen3-VL + Transformers (PyPI) Offline Prep
-# ============================================================================
-# What this script does:
-#  1) Create/activate shared conda env (prefix) on shared filesystem
-#  2) FORCE pip to use OFFICIAL PyPI (ignores any internal pip.conf)
-#  3) Download wheels into shared wheelhouse for OFFLINE GPU install
-#     - transformers==5.1.0 (supports qwen3_vl)
-#     - huggingface_hub/accelerate/tokenizers/safetensors/etc
-#     - torch/torchvision from official PyTorch CUDA index
-#  4) Download Qwen3-VL model snapshot into shared models dir (resume, no symlinks)
-#  5) (Optional) COCO presence check (does not download COCO)
+# =============================================================================
+# cpu.sh (CPU server HAS internet)
 #
-# No self-copying, no renaming, no writing into your git repo.
-# ============================================================================
+# Goal: Prepare an OFFLINE-friendly wheelhouse + download Qwen3-VL model files.
+# Fixes all dependency conflicts you saw by aligning versions with
+# Transformers 5.x requirements (tokenizers>=0.22, huggingface-hub>=1.3).
+#
+# Key references:
+# - Latest Transformers release on PyPI is 5.2.0 (Feb 16, 2026). 
+# - Latest huggingface-hub release on PyPI is 1.4.1 (Feb 6, 2026).
+# - Latest tokenizers release line is 0.22.x (e.g., 0.22.2 Jan 5, 2026).
+# - huggingface_hub provides is_offline_mode() and uses HF_HUB_OFFLINE=1.
+#
+# This script:
+#  1) Creates/activates shared conda env (prefix) on shared filesystem
+#  2) Forces pip to use OFFICIAL PyPI (ignores any internal pip.conf)
+#  3) Downloads wheels into shared wheelhouse (for GPU offline install)
+#  4) Downloads Qwen3-VL model snapshot into shared models dir
+#
+# No self-copying / no renaming / no git operations.
+# =============================================================================
 
 set -euo pipefail
 
@@ -21,19 +27,18 @@ set -euo pipefail
 # Shared paths
 # ----------------------------
 BASE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare"
-CODE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/code"
 ENV_DIR="${BASE_DIR}/conda_envs/ced_p0"
 WHEELHOUSE="${BASE_DIR}/packages"
 HF_HOME_DIR="${BASE_DIR}/.hf_cache"
 
 # ----------------------------
-# Model config
+# Model selection
 # ----------------------------
 export MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
 export MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
 
 # ----------------------------
-# FORCE OFFICIAL PyPI
+# Force OFFICIAL PyPI
 # ----------------------------
 export PIP_CONFIG_FILE="/dev/null"
 export PIP_INDEX_URL="https://pypi.org/simple"
@@ -50,32 +55,20 @@ PYPI="https://pypi.org/simple"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME_OVERRIDE:-$HF_HOME_DIR}"
 
-# ----------------------------
-# COCO check paths
-# ----------------------------
-COCO_DIR="${BASE_DIR}/data/coco"
-COCO_IMG_DIR="${COCO_DIR}/images/val2017"
-COCO_ANN_FILE="${COCO_DIR}/annotations/instances_val2017.json"
+mkdir -p "${WHEELHOUSE}" "${HF_HOME}" "${MODEL_DIR}"
 
-echo "============================================"
-echo "[CPU] BASE_DIR    : ${BASE_DIR}"
-echo "[CPU] CODE_DIR    : ${CODE_DIR}"
+echo "============================================================"
 echo "[CPU] ENV_DIR     : ${ENV_DIR}"
 echo "[CPU] WHEELHOUSE  : ${WHEELHOUSE}"
 echo "[CPU] HF_ENDPOINT : ${HF_ENDPOINT}"
 echo "[CPU] HF_HOME     : ${HF_HOME}"
 echo "[CPU] MODEL_REPO  : ${MODEL_REPO}"
 echo "[CPU] MODEL_DIR   : ${MODEL_DIR}"
-echo "============================================"
-
-mkdir -p "${WHEELHOUSE}" "${HF_HOME}" "${MODEL_DIR}" "${CODE_DIR}"
-mkdir -p "${COCO_DIR}/images" "${COCO_DIR}/annotations"
+echo "============================================================"
 
 # -------------------------------------------------------------------
-# Step 1: Create/activate conda env (shared prefix)
+# Step 1: conda prefix env
 # -------------------------------------------------------------------
-echo "[1/5] Creating/activating conda environment..."
-
 __conda_setup="$('conda' 'shell.bash' 'hook' 2>/dev/null || true)"
 if [ -n "${__conda_setup}" ]; then
   eval "$__conda_setup"
@@ -93,36 +86,70 @@ else
 fi
 
 conda activate "${ENV_DIR}"
-echo "[CPU] python: $(python -V) @ $(which python)"
-
-python -m pip install --upgrade pip setuptools wheel -i "${PYPI}" --trusted-host pypi.org
+python -V
+python -m pip install -U pip setuptools wheel -i "${PYPI}" --trusted-host pypi.org
 
 # -------------------------------------------------------------------
-# Step 2: Download wheels
+# Step 2: build a pinned requirements list (GPU offline lockfile)
+#   IMPORTANT: tokenizers and huggingface-hub MUST match Transformers 5.x.
 # -------------------------------------------------------------------
-echo "[2/5] Downloading wheels to wheelhouse..."
+REQ_FILE="${WHEELHOUSE}/requirements.offline.txt"
+cat > "${REQ_FILE}" << 'EOF'
+# Core: Transformers + exact compatible deps
+transformers==5.2.0
+huggingface-hub==1.4.1
+tokenizers==0.22.2
+safetensors>=0.4.3
+numpy==1.26.4
+packaging>=20.0
+pyyaml>=5.1
+regex!=2019.12.17
+tqdm>=4.27
+typer-slim
 
-# Transformers (new enough for qwen3_vl)
-python -m pip download -d "${WHEELHOUSE}" -i "${PYPI}" --trusted-host pypi.org   "transformers==5.1.0"
+# VLM utils & common scientific stack used by your experiment
+accelerate==1.3.0
+sentencepiece==0.2.0
+qwen-vl-utils==0.0.10
+Pillow==11.1.0
+pycocotools==2.0.8
+pandas==2.2.3
+scipy==1.14.1
+scikit-learn==1.6.1
+matplotlib==3.9.4
+seaborn==0.13.2
+av==14.1.0
+EOF
 
-# HuggingFace + runtime deps
-python -m pip download -d "${WHEELHOUSE}" -i "${PYPI}" --trusted-host pypi.org   "huggingface_hub[cli]==0.28.1"   "accelerate==1.3.0"   "safetensors==0.5.2"   "tokenizers==0.21.0"   "sentencepiece==0.2.0"   "qwen-vl-utils==0.0.10"   "numpy==1.26.4"   "scipy==1.14.1"   "scikit-learn==1.6.1"   "matplotlib==3.9.4"   "seaborn==0.13.2"   "Pillow==11.1.0"   "pycocotools==2.0.8"   "tqdm==4.67.1"   "pandas==2.2.3"   "av==14.1.0"
+echo "[CPU] requirements written: ${REQ_FILE}"
+sed -n '1,120p' "${REQ_FILE}"
 
-# Torch CUDA wheels (official PyTorch index)
+# -------------------------------------------------------------------
+# Step 3: download wheels for ALL requirements (and their deps) from OFFICIAL PyPI
+# -------------------------------------------------------------------
+echo "[CPU] Downloading wheels into wheelhouse (PyPI)..."
+python -m pip download -d "${WHEELHOUSE}" -r "${REQ_FILE}" \
+  -i "${PYPI}" --trusted-host pypi.org
+
+# Torch CUDA wheels from official PyTorch index
+echo "[CPU] Downloading PyTorch CUDA wheels..."
 TORCH_IDX="https://download.pytorch.org/whl/cu124"
-python -m pip download -d "${WHEELHOUSE}" --index-url "${TORCH_IDX}"   torch==2.5.1 torchvision==0.20.1
+python -m pip download -d "${WHEELHOUSE}" --index-url "${TORCH_IDX}" \
+  torch==2.5.1 torchvision==0.20.1
 
-echo "[CPU] wheelhouse file count:"
-ls -1 "${WHEELHOUSE}" | wc -l | awk '{print "  files:", $1}'
-ls -lh "${WHEELHOUSE}"/transformers-5.1.0*.whl 2>/dev/null || true
+# Sanity checks: ensure the critical wheels exist
+echo "[CPU] Sanity check critical wheels..."
+ls -lh "${WHEELHOUSE}"/transformers-5.2.0*.whl
+ls -lh "${WHEELHOUSE}"/huggingface_hub-1.4.1*.whl
+ls -lh "${WHEELHOUSE}"/tokenizers-0.22.2*.whl
 
 # -------------------------------------------------------------------
-# Step 3: Download Qwen3-VL model snapshot
+# Step 4: download model snapshot using huggingface_hub Python API
 # -------------------------------------------------------------------
-echo "[3/5] Downloading/resuming model snapshot to ${MODEL_DIR} ..."
+echo "[CPU] Installing huggingface-hub==1.4.1 into CPU env for snapshot_download..."
+python -m pip install -U "huggingface-hub==1.4.1" -i "${PYPI}" --trusted-host pypi.org
 
-python -m pip install -U "huggingface_hub[cli]==0.28.1" -i "${PYPI}" --trusted-host pypi.org
-
+echo "[CPU] Downloading/resuming model snapshot..."
 python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
@@ -140,28 +167,12 @@ snapshot_download(
 print(f"[CPU] snapshot_download done: {repo_id} -> {local_dir}")
 PY
 
-echo "[CPU] sanity check model dir (top 30):"
+echo "[CPU] Model dir top files:"
 ls -lh "${MODEL_DIR}" | head -n 30
 
-# -------------------------------------------------------------------
-# Step 4: COCO check (no download)
-# -------------------------------------------------------------------
-echo "[4/5] COCO check..."
-if [ -d "${COCO_IMG_DIR}" ] && [ "$(ls -1 "${COCO_IMG_DIR}" 2>/dev/null | wc -l)" -gt 4000 ] && [ -f "${COCO_ANN_FILE}" ]; then
-  echo "[CPU] COCO val2017 OK: ${COCO_IMG_DIR} + ${COCO_ANN_FILE}"
-else
-  echo "[CPU] COCO not complete (skipping download)."
-  echo "      images: ${COCO_IMG_DIR}"
-  echo "      ann   : ${COCO_ANN_FILE}"
-fi
-
-# -------------------------------------------------------------------
-# Step 5: Done
-# -------------------------------------------------------------------
-echo "[5/5] Done."
-echo "============================================"
-echo "[CPU] READY."
-echo "Wheelhouse : ${WHEELHOUSE}"
-echo "Model dir  : ${MODEL_DIR}"
-echo "Next (GPU): run gpu_official.sh"
-echo "============================================"
+echo "============================================================"
+echo "[CPU] DONE."
+echo "[CPU] Wheelhouse: ${WHEELHOUSE}"
+echo "[CPU] Model dir : ${MODEL_DIR}"
+echo "Next: run gpu.sh on GPU node (offline)."
+echo "============================================================"

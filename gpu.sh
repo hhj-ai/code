@@ -1,17 +1,16 @@
 #!/bin/bash
-# ============================================================================
-# gpu.sh (GPU has NO internet) - Offline install + run (Qwen3-VL)
-# ============================================================================
-# What this script does:
-#  1) Activate shared conda env (prefix) from shared FS
-#  2) Offline-install packages from wheelhouse
-#     - FORCE transformers==5.1.0 (supports qwen3_vl)
-#  3) Fix CUDA nvJitLink mismatch by preferring wheel-bundled nvjitlink
-#  4) Verify AutoConfig recognizes qwen3_vl
-#  5) Run main.py (P0-a / P0-b)
+# =============================================================================
+# gpu.sh (GPU server has NO internet)
 #
-# No file renaming/copying.
-# ============================================================================
+# Goal: Offline install a compatible stack (Transformers 5.2.0 + hub 1.4.1
+# + tokenizers 0.22.2) and run your CED Phase 0 main.py.
+#
+# Fixes your error:
+#   ImportError: cannot import name 'is_offline_mode' from 'huggingface_hub'
+# which happens when huggingface-hub is too old (e.g., 0.28.1).
+#
+# Also keeps the CUDA nvJitLink workaround to avoid symbol mismatch issues.
+# =============================================================================
 
 set -euo pipefail
 
@@ -27,14 +26,14 @@ COCO_IMG_DIR="${BASE_DIR}/data/coco/images/val2017"
 COCO_ANN_FILE="${BASE_DIR}/data/coco/annotations/instances_val2017.json"
 OUT_DIR="${CODE_DIR}/results_p0"
 
-echo "============================================"
+echo "============================================================"
 echo "[GPU] ENV_DIR    : ${ENV_DIR}"
 echo "[GPU] WHEELHOUSE : ${WHEELHOUSE}"
 echo "[GPU] MODEL_DIR  : ${MODEL_DIR}"
-echo "============================================"
+echo "============================================================"
 
 # -------------------------------------------------------------------
-# Step 1: Activate conda env (prefix)
+# Step 1: Activate conda prefix env
 # -------------------------------------------------------------------
 __conda_setup="$('conda' 'shell.bash' 'hook' 2>/dev/null || true)"
 if [ -n "${__conda_setup}" ]; then
@@ -45,6 +44,7 @@ else
   source "${CONDA_BASE}/etc/profile.d/conda.sh"
 fi
 
+# Clean nested activations (common source of weirdness)
 conda deactivate 2>/dev/null || true
 conda deactivate 2>/dev/null || true
 conda activate "${ENV_DIR}"
@@ -54,42 +54,57 @@ echo "[GPU] python=$(which python)"
 python -V
 
 # -------------------------------------------------------------------
-# Step 2: CUDA lib mix fix (nvJitLink)
+# Step 2: CUDA nvJitLink fix (prefer wheel-bundled nvjitlink over /usr/local/cuda)
 # -------------------------------------------------------------------
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/nvjitlink/lib:$LD_LIBRARY_PATH"
 
 # -------------------------------------------------------------------
-# Step 3: OFFLINE flags
+# Step 3: Offline flags
+#   - huggingface_hub offline mode uses HF_HUB_OFFLINE=1
 # -------------------------------------------------------------------
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
 # -------------------------------------------------------------------
-# Step 4: Offline install from wheelhouse
+# Step 4: Offline install (FORCE correct versions)
 # -------------------------------------------------------------------
-echo "[GPU] Installing packages from wheelhouse (offline)..."
+echo "[GPU] Uninstall conflicting old packages (if any)..."
+pip uninstall -y transformers huggingface-hub tokenizers || true
 
+echo "[GPU] Install torch/torchvision from wheelhouse (offline)..."
 pip install --no-index --find-links="${WHEELHOUSE}" torch==2.5.1 torchvision==0.20.1 || true
 
-pip uninstall -y transformers || true
-pip install --no-index --find-links="${WHEELHOUSE}" "transformers==5.1.0"
+echo "[GPU] Install pinned compatible HF stack (offline)..."
+pip install --no-index --find-links="${WHEELHOUSE}" \
+  tokenizers==0.22.2 \
+  huggingface-hub==1.4.1 \
+  transformers==5.2.0
 
-pip install --no-index --find-links="${WHEELHOUSE}"   "huggingface_hub[cli]==0.28.1" accelerate==1.3.0 safetensors==0.5.2 tokenizers==0.21.0 sentencepiece==0.2.0 qwen-vl-utils==0.0.10   numpy==1.26.4 scipy==1.14.1 scikit-learn==1.6.1 matplotlib==3.9.4 seaborn==0.13.2 Pillow==11.1.0 pycocotools==2.0.8 tqdm==4.67.1 pandas==2.2.3 av==14.1.0   requests packaging pyyaml regex filelock fsspec typing-extensions jinja2 sympy networkx
+echo "[GPU] Install remaining pinned deps (offline)..."
+REQ_FILE="${WHEELHOUSE}/requirements.offline.txt"
+if [ ! -f "${REQ_FILE}" ]; then
+  echo "ERROR: ${REQ_FILE} not found. Run cpu.sh first."
+  exit 1
+fi
+# Install everything else from the lockfile (will be no-op for already-installed pins)
+pip install --no-index --find-links="${WHEELHOUSE}" -r "${REQ_FILE}"
 
-echo "[GPU] Package verification:"
+echo "[GPU] Verify imports & versions..."
 python - <<'PY'
 import torch, transformers
-print("PyTorch", torch.__version__, "CUDA=", torch.cuda.is_available(), "GPUs=", torch.cuda.device_count())
-print("Transformers", transformers.__version__)
+from huggingface_hub import is_offline_mode
+print("PyTorch      :", torch.__version__, "CUDA=", torch.cuda.is_available(), "GPUs=", torch.cuda.device_count())
+print("Transformers :", transformers.__version__)
+print("HF hub offline:", is_offline_mode())
 PY
 
-echo "[GPU] Verifying AutoConfig recognizes qwen3_vl..."
+echo "[GPU] Verify qwen3_vl config is recognized..."
 python - <<'PY'
 import os
 from transformers import AutoConfig
 cfg = AutoConfig.from_pretrained(os.environ["MODEL_DIR"], trust_remote_code=True)
-print("Loaded config.model_type =", getattr(cfg, "model_type", None))
+print("config.model_type =", getattr(cfg, "model_type", None))
 PY
 
 # -------------------------------------------------------------------
@@ -103,12 +118,27 @@ export ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 
 echo ""
 echo "========== P0-a: Architecture Probing =========="
-python main.py   --mode probe   --model_path "${MODEL_DIR}"   --coco_img_dir "${COCO_IMG_DIR}"   --coco_ann_file "${COCO_ANN_FILE}"   --output_dir "${OUT_DIR}"   2>&1 | tee "${OUT_DIR}/log_p0a.txt"
+python main.py \
+  --mode probe \
+  --model_path "${MODEL_DIR}" \
+  --coco_img_dir "${COCO_IMG_DIR}" \
+  --coco_ann_file "${COCO_ANN_FILE}" \
+  --output_dir "${OUT_DIR}" \
+  2>&1 | tee "${OUT_DIR}/log_p0a.txt"
 
 echo ""
 echo "========== P0-b: CED Signal Validation =========="
-python main.py   --mode validate   --model_path "${MODEL_DIR}"   --coco_img_dir "${COCO_IMG_DIR}"   --coco_ann_file "${COCO_ANN_FILE}"   --output_dir "${OUT_DIR}"   --num_samples 500   --layers logits 12 16 20 24 27   --lambda_e_values 0.0 0.05 0.1 0.2 0.3 0.5   2>&1 | tee "${OUT_DIR}/log_p0b.txt"
+python main.py \
+  --mode validate \
+  --model_path "${MODEL_DIR}" \
+  --coco_img_dir "${COCO_IMG_DIR}" \
+  --coco_ann_file "${COCO_ANN_FILE}" \
+  --output_dir "${OUT_DIR}" \
+  --num_samples 500 \
+  --layers logits 12 16 20 24 27 \
+  --lambda_e_values 0.0 0.05 0.1 0.2 0.3 0.5 \
+  2>&1 | tee "${OUT_DIR}/log_p0b.txt"
 
-echo "============================================"
-echo "[GPU] Done. Results: ${OUT_DIR}"
-echo "============================================"
+echo "============================================================"
+echo "[GPU] DONE. Results: ${OUT_DIR}"
+echo "============================================================"
