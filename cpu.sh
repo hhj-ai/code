@@ -19,11 +19,8 @@ add_lib_dir () {
     fi
   fi
 }
-# conda env libs
 add_lib_dir "$CED_ENV/lib"
-# torch bundled libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/torch/lib"
-# pip nvidia libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/nvjitlink/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cusparse/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cublas/lib"
@@ -31,7 +28,7 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
 
-    # ✅ HF 缓存放到项目目录（可控）
+    # ✅ HF 缓存建议放到项目目录（可控、可迁移）
     export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
     export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
     export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
@@ -44,7 +41,7 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
     # 只下载不加载（规避 torch/CUDA so 问题）：DOWNLOAD_ONLY=1 bash cpu.sh
     if [ "${DOWNLOAD_ONLY:-0}" = "1" ]; then
-      "$PY" -u main.py \
+      "$PY" -u main_v7.py \
         --repo-id "$MODEL_ID" \
         --local-dir "$LOCAL_DIR" \
         --cache-dir "$CACHE_DIR" \

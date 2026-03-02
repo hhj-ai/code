@@ -17,11 +17,8 @@ add_lib_dir () {
     fi
   fi
 }
-# conda env libs
 add_lib_dir "$CED_ENV/lib"
-# torch bundled libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/torch/lib"
-# pip nvidia libs
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/nvjitlink/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cusparse/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cublas/lib"
