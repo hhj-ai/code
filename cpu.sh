@@ -62,6 +62,15 @@ fi
 
 # Activate via prefix path (works regardless of envs_dirs config)
 conda activate "${ENV_DIR}"
+
+# Verify we're in the right env (NOT system base)
+ACTUAL_PYTHON=$(which python)
+if [[ "${ACTUAL_PYTHON}" != "${ENV_DIR}"* ]]; then
+    echo "WARNING: python resolves to ${ACTUAL_PYTHON}, expected ${ENV_DIR}/bin/python"
+    echo "         Trying direct path activation..."
+    export PATH="${ENV_DIR}/bin:$PATH"
+    export CONDA_PREFIX="${ENV_DIR}"
+fi
 echo "Activated: $(which python)"
 echo "Python:   $(python --version)"
 
@@ -119,16 +128,45 @@ echo "Downloaded $(ls ${PKG}/ | wc -l) package files to ${PKG}/"
 # -------------------------------------------------------------------
 echo "[3/5] Downloading Qwen2.5-VL-7B-Instruct..."
 
+# Verify we are using the conda env's python, NOT system base
+echo "  which python: $(which python)"
+echo "  python version: $(python --version)"
+echo "  which pip: $(which pip)"
+
 MODEL_DIR="${BASE_DIR}/models/Qwen2.5-VL-7B-Instruct"
 if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/config.json" ]; then
     echo "Model already exists, skipping."
 else
-    # Ensure huggingface-cli available
-    pip install huggingface-hub -i "${PYPI}" --trusted-host pypi.org
-    huggingface-cli download \
+    # Install/upgrade huggingface_hub in our conda env
+    pip install --upgrade "huggingface-hub>=0.27.1" \
+        -i "${PYPI}" --trusted-host pypi.org
+
+    # --- KEY FIXES for corporate network ---
+    # 1. Disable xet storage protocol (causes SSL errors behind proxy/firewall)
+    export HF_HUB_ENABLE_HF_TRANSFER=0
+    export HF_HUB_DISABLE_XET=1
+
+    # 2. If SSL still fails, uncomment the next two lines:
+    # export CURL_CA_BUNDLE=""
+    # export REQUESTS_CA_BUNDLE=""
+
+    # 3. Use python -m to guarantee we call OUR env's huggingface-cli
+    python -m huggingface_hub.commands.huggingface_cli download \
         Qwen/Qwen2.5-VL-7B-Instruct \
         --local-dir "${MODEL_DIR}" \
         --local-dir-use-symlinks False
+
+    # If the above still fails with SSL, try the fallback:
+    # python -c "
+    # import os
+    # os.environ['HF_HUB_DISABLE_XET'] = '1'
+    # from huggingface_hub import snapshot_download
+    # snapshot_download(
+    #     'Qwen/Qwen2.5-VL-7B-Instruct',
+    #     local_dir='${MODEL_DIR}',
+    #     local_dir_use_symlinks=False,
+    # )
+    # "
 fi
 echo "Model ready at ${MODEL_DIR}"
 

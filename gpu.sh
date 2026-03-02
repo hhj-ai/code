@@ -62,6 +62,15 @@ fi
 
 # Activate via full prefix path (no need for env name lookup)
 conda activate "${ENV_DIR}"
+
+# Verify we're in the right env (NOT system base)
+ACTUAL_PYTHON=$(which python)
+if [[ "${ACTUAL_PYTHON}" != "${ENV_DIR}"* ]]; then
+    echo "WARNING: python resolves to ${ACTUAL_PYTHON}, expected ${ENV_DIR}/bin/python"
+    echo "         Falling back to direct PATH manipulation..."
+    export PATH="${ENV_DIR}/bin:$PATH"
+    export CONDA_PREFIX="${ENV_DIR}"
+fi
 echo "  Python: $(which python) -> $(python --version)"
 
 # -------------------------------------------------------------------
@@ -125,6 +134,7 @@ cd "${CODE_DIR}"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export HF_HUB_DISABLE_XET=1
 
 # Single GPU is sufficient for P0
 export CUDA_VISIBLE_DEVICES=0
