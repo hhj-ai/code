@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""main.py
+"""main.py (v6)
 
-目标：
-- 仍然保持你要的布局（cpu.sh / gpu.sh / main.py）
-- 通过 cpu.sh / gpu.sh 使用 conda 环境的绝对路径 python（不依赖 conda activate）
-- 修复/规避：
-  1) hf CLI 的 --local-dir-use-symlinks 不兼容：不再使用
-  2) Qwen3VLConfig 没有顶层 num_hidden_layers：自动从 text_config/llm_config 等读取，必要时从模型结构推断
-  3) visual pos_embed 等权重尺寸不匹配：ignore_mismatched_sizes=True
-  4) 允许 --download-only：下载阶段不导入 torch，避免“torch import 直接炸”导致下载也跑不了
+你遇到的问题（结合上下文）：
+- 你原工程在用 Qwen3-VL（日志出现 Qwen3VLConfig），但我之前脚本默认写成了 Qwen2.5-VL-7B，所以才会重新下 16GB。
+- 你机器上的 `hf` CLI 版本不支持某些参数（如 --resume-download），所以不要依赖 CLI。
 
-兼容：
-- Python 3.8+（不使用 list[str] 这类 3.9+ 注解语法）
+本版目标：
+1) 默认用“自动本地复用”：优先在你项目常见目录里找已下载的 Qwen3-VL（有 config.json + *.safetensors/*.bin）。
+   找到了就直接用本地目录，完全不下载。
+2) 如果没找到，再从 Hub 下载 Qwen3-VL（默认 fallback：Qwen/Qwen3-VL-8B-Instruct）到一个稳定目录（默认 ../dataprepare/models/...）
+3) 不再调用 hf CLI，统一使用 huggingface_hub.snapshot_download（避免 CLI 版本差异）。
+4) 支持 --download-only：下载阶段不 import torch，避免 torch/CUDA so 问题把下载也卡死。
+5) 兼容 Python 3.8+。
+
+用法：
+  - 默认（自动找本地 Qwen3-VL，否则下载 fallback）：
+      python main.py --download-only
+  - 直接指定本地目录（强制不下载）：
+      python main.py --repo-id /abs/path/to/Qwen3-VL
+  - 强制指定 Hub repo（会下载到 local-dir）：
+      python main.py --repo-id Qwen/Qwen3-VL-8B-Instruct --local-dir /path/to/save
+
+额外：
+  - 若你下载速度慢/频繁限流，设置 HF_TOKEN 可提高限额/速度（在 shell 里 export HF_TOKEN=...）。
 """
 
 from __future__ import annotations
@@ -21,80 +32,100 @@ from __future__ import annotations
 import os
 import sys
 import argparse
-import subprocess
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, Dict, List, Tuple
 
 from huggingface_hub import snapshot_download
 
 
-def _run(cmd: List[str]) -> None:
-    """Run a command; raise on failure."""
-    print("[CMD]", " ".join(cmd), flush=True)
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(p.stdout, flush=True)
-    if p.returncode != 0:
-        raise RuntimeError("Command failed ({}): {}".format(p.returncode, " ".join(cmd)))
+def _has_weights(d: str) -> bool:
+    if not os.path.isdir(d):
+        return False
+    if not os.path.exists(os.path.join(d, "config.json")):
+        return False
+    for root, _, files in os.walk(d):
+        for fn in files:
+            if fn.endswith(".safetensors") or fn.endswith(".bin"):
+                return True
+    return False
 
 
-def ensure_downloaded(repo_id_or_path: str, local_dir: str, cache_dir: Optional[str]) -> str:
-    """
-    Ensure model weights exist locally.
+def _list_dir_children(parent: str) -> List[str]:
+    try:
+        return [os.path.join(parent, x) for x in os.listdir(parent)]
+    except Exception:
+        return []
 
-    - If repo_id_or_path is a local directory -> return it.
-    - Else try `hf download ... --local-dir ...` (no deprecated flags).
-    - If CLI fails, fall back to huggingface_hub.snapshot_download().
-    """
+
+def find_existing_qwen3vl(preferred_roots: List[str]) -> Optional[str]:
+    """在常见目录中寻找已存在的 Qwen3-VL 模型目录。"""
+    # 先尝试一些常见固定名字（命中率最高）
+    common_names = [
+        "Qwen3-VL-8B-Instruct",
+        "Qwen3-VL-7B-Instruct",
+        "Qwen3-VL-4B-Instruct",
+        "Qwen3-VL-2B-Instruct",
+    ]
+    for r in preferred_roots:
+        for name in common_names:
+            p = os.path.join(r, name)
+            if _has_weights(p):
+                return p
+
+    # 再做一次“浅扫描”：找名字里同时包含 qwen3 和 vl 的目录
+    for r in preferred_roots:
+        for child in _list_dir_children(r):
+            bn = os.path.basename(child).lower()
+            if ("qwen3" in bn) and ("vl" in bn) and os.path.isdir(child) and _has_weights(child):
+                return child
+
+    return None
+
+
+def ensure_downloaded(repo_id_or_path: str,
+                      local_dir: str,
+                      cache_dir: Optional[str],
+                      preferred_roots: List[str],
+                      fallback_repo: str) -> str:
+    """确保模型在本地可用，优先复用已有本地目录，避免重复下载。"""
+    # 1) 如果直接给了本地目录
     if os.path.isdir(repo_id_or_path):
+        if not _has_weights(repo_id_or_path):
+            raise RuntimeError("Provided local dir has no weights/config.json: {}".format(repo_id_or_path))
         return repo_id_or_path
+
+    # 2) auto：优先在 preferred_roots 中找
+    if repo_id_or_path == "auto":
+        hit = find_existing_qwen3vl(preferred_roots)
+        if hit:
+            print("[OK] Reusing existing local Qwen3-VL:", hit, flush=True)
+            return hit
+        repo_id_or_path = fallback_repo  # 没找到就用 fallback 下载
+
+    # 3) local_dir 已经完整就直接用（同一个目录跑，不会重复下）
+    if _has_weights(local_dir):
+        return local_dir
 
     os.makedirs(local_dir, exist_ok=True)
 
-    def has_weights(d: str) -> bool:
-        if not os.path.isdir(d):
-            return False
-        for root, _, files in os.walk(d):
-            for fn in files:
-                if fn.endswith(".safetensors") or fn.endswith(".bin"):
-                    return True
-        return False
-
-    if has_weights(local_dir) and os.path.exists(os.path.join(local_dir, "config.json")):
-        return local_dir
-
-    # 1) Try hf CLI if available
-    try:
-        cmd = ["hf", "download", repo_id_or_path, "--repo-type", "model", "--local-dir", local_dir]
-        if cache_dir:
-            cmd += ["--cache-dir", cache_dir]
-        cmd += ["--resume-download"]
-        _run(cmd)
-        if has_weights(local_dir):
-            return local_dir
-    except Exception as e:
-        print("[WARN] hf CLI download failed; fallback to snapshot_download(): {}".format(e), file=sys.stderr)
-
-    # 2) Python fallback
+    # 4) 下载（不依赖 hf CLI）
     kwargs: Dict[str, Any] = dict(
         repo_id=repo_id_or_path,
         repo_type="model",
         local_dir=local_dir,
     )
+    # 注意：当 local_dir 指定时，hub 的文档说明 cache_dir 不会被用作主缓存，
+    # 但传了也不影响；这里保留以兼容部分版本/内部实现。
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
 
-    # local_dir_use_symlinks 在不同版本可能被改动；安全处理
-    try:
-        snapshot_download(local_dir_use_symlinks=False, **kwargs)  # type: ignore
-    except TypeError:
-        snapshot_download(**kwargs)
+    snapshot_download(**kwargs)
 
-    if not has_weights(local_dir):
+    if not _has_weights(local_dir):
         raise RuntimeError("Download finished but no weights found in: {}".format(local_dir))
     return local_dir
 
 
 def _get_num_hidden_layers(cfg: Any, model: Optional[Any] = None) -> int:
-    """Robustly determine transformer depth across common config layouts."""
     if hasattr(cfg, "num_hidden_layers"):
         return int(getattr(cfg, "num_hidden_layers"))
 
@@ -124,35 +155,22 @@ def _get_num_hidden_layers(cfg: Any, model: Optional[Any] = None) -> int:
 
 
 def _import_torch_and_transformers():
-    """
-    Delay-import torch/transformers so --download-only can run even if torch import fails.
-    If torch import fails, print a crisp diagnostic and re-raise.
-    """
     try:
-        import torch  # noqa
+        import torch
     except Exception as e:
-        msg = (
-            "\n[FATAL] import torch 失败。\n"
-            "这通常不是脚本问题，而是 CUDA 动态库版本不匹配（例如 libcusparse.so.12 需要更新的 libnvJitLink.so.12）。\n"
-            "你可以：\n"
-            "  1) 优先用 cpu.sh/gpu.sh 里设置的 LD_LIBRARY_PATH，让 conda env 自带的 nvidia 库优先生效；\n"
-            "  2) 或者重装与驱动兼容的 PyTorch CUDA 版本；\n"
-            "  3) 如果只想在 CPU 跑，安装 CPU-only 的 torch。\n"
-            f"原始异常: {repr(e)}\n"
-        )
-        print(msg, file=sys.stderr)
+        print("[FATAL] import torch 失败：{}".format(repr(e)), file=sys.stderr)
         raise
 
-    # transformers imports
-    from transformers import AutoProcessor  # noqa
+    from transformers import AutoProcessor
     try:
-        from transformers import AutoModelForVision2Seq  # noqa
+        from transformers import AutoModelForVision2Seq
         has_v2s = True
     except Exception:
+        AutoModelForVision2Seq = None
         has_v2s = False
 
-    from transformers import AutoModelForCausalLM  # noqa
-    return torch, AutoProcessor, has_v2s, AutoModelForCausalLM, (AutoModelForVision2Seq if has_v2s else None)
+    from transformers import AutoModelForCausalLM
+    return torch, AutoProcessor, has_v2s, AutoModelForCausalLM, AutoModelForVision2Seq
 
 
 def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool):
@@ -196,16 +214,22 @@ def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool
 
 class CEDExperiment:
     def __init__(self, model_path: str, device: str, dtype: str, trust_remote_code: bool):
-        self.device = device
         self.processor, self.model = load_model(model_path, device=device, dtype=dtype, trust_remote_code=trust_remote_code)
         self.num_layers = _get_num_hidden_layers(self.model.config, self.model)
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--repo-id", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
-    p.add_argument("--local-dir", type=str, default="./models/Qwen2.5-VL-7B-Instruct")
+    # ✅ 默认 auto：优先复用本地 Qwen3-VL
+    p.add_argument("--repo-id", type=str, default="auto",
+                   help="auto | HF repo id (e.g. Qwen/Qwen3-VL-8B-Instruct) | local dir path")
+    # ✅ 默认落到 dataprepare/models（更符合你原工程的布局）
+    p.add_argument("--local-dir", type=str, default="../dataprepare/models/Qwen3-VL-8B-Instruct")
     p.add_argument("--cache-dir", type=str, default=None)
+    p.add_argument("--preferred-root", action="append", default=[],
+                   help="Add a directory to search existing local models (can be repeated).")
+    p.add_argument("--fallback-repo", type=str, default="Qwen/Qwen3-VL-8B-Instruct")
+
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--dtype", type=str, default="auto")
     p.add_argument("--trust-remote-code", action="store_true", default=True)
@@ -218,8 +242,24 @@ def parse_args():
 def main():
     args = parse_args()
 
-    model_path = ensure_downloaded(args.repo_id, args.local_dir, args.cache_dir)
-    print("[OK] Model files ready at: {}".format(model_path), flush=True)
+    # 默认搜索根目录：dataprepare/models 和 code/models（结合你的工程结构）
+    preferred_roots = []
+    if args.preferred_root:
+        preferred_roots.extend(args.preferred_root)
+    preferred_roots.extend([
+        "../dataprepare/models",
+        "./models",
+        "../models",
+    ])
+
+    model_path = ensure_downloaded(
+        repo_id_or_path=args.repo_id,
+        local_dir=args.local_dir,
+        cache_dir=args.cache_dir,
+        preferred_roots=preferred_roots,
+        fallback_repo=args.fallback_repo,
+    )
+    print("[OK] Model ready at: {}".format(os.path.abspath(model_path)), flush=True)
 
     if args.download_only:
         return
@@ -228,7 +268,6 @@ def main():
     print("[OK] Loaded model. num_layers = {}".format(exp.num_layers), flush=True)
 
     if args.smoke_test:
-        # Small smoke test (text only)
         import torch
         with torch.no_grad():
             inputs = exp.processor(text="Hello World", return_tensors="pt")
