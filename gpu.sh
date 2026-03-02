@@ -12,7 +12,7 @@ CODE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangman
 OUTPUT_DIR="${CODE_DIR}/results_p0"
 
 ENV_DIR="${BASE_DIR}/conda_envs/ced_p0"
-MODEL_PATH="${BASE_DIR}/models/Qwen2.5-VL-7B-Instruct"
+MODEL_PATH="${BASE_DIR}/models/Qwen3-VL-8B-Instruct"
 COCO_IMG_DIR="${BASE_DIR}/data/coco/images/val2017"
 COCO_ANN_FILE="${BASE_DIR}/data/coco/annotations/instances_val2017.json"
 PACKAGES_DIR="${BASE_DIR}/packages"
@@ -108,7 +108,7 @@ pip install --no-index --find-links="${PACKAGES_DIR}" \
 
 # Transformers ecosystem
 pip install --no-index --find-links="${PACKAGES_DIR}" \
-    transformers==4.48.3 \
+    transformers \
     accelerate==1.3.0 \
     qwen-vl-utils==0.0.10 \
     huggingface-hub==0.27.1 \

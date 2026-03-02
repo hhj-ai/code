@@ -86,6 +86,9 @@ pip download \
     -d "${PKG}/"
 
 # --- Transformers ecosystem ---
+# NOTE: Qwen3-VL requires latest transformers; build wheel from source for offline GPU.
+pip wheel -w "${PKG}/" "git+https://github.com/huggingface/transformers.git"
+
 pip download \
     "transformers==4.48.3" \
     "accelerate==1.3.0" \
@@ -119,7 +122,8 @@ echo "Downloaded $(ls ${PKG}/ | wc -l) package files to ${PKG}/"
 # -------------------------------------------------------------------
 echo "[3/5] Downloading Qwen2.5-VL-7B-Instruct (mirror + resume)..."
 
-MODEL_DIR="${BASE_DIR}/models/Qwen2.5-VL-7B-Instruct"
+MODEL_REPO="Qwen/Qwen3-VL-8B-Instruct"
+MODEL_DIR="${BASE_DIR}/models/Qwen3-VL-8B-Instruct"
 mkdir -p "${MODEL_DIR}"
 
 # Put HF cache on shared disk (avoids permission issues like writing to /models or other protected paths)
@@ -152,21 +156,23 @@ done
 if [ ${need_download} -eq 0 ]; then
   echo "[MODEL] already complete, skipping download."
 else
-  echo "[MODEL] downloading/resuming to ${MODEL_DIR} ..."
+  echo "export MODEL_REPO="$MODEL_REPO"
+export MODEL_DIR_PATH="$MODEL_DIR"
+
+[MODEL] downloading/resuming to ${MODEL_DIR} ..."
   if command -v hf >/dev/null 2>&1; then
     # Use Python API to control local_dir_use_symlinks (hf CLI doesn't expose it).
 python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
-repo_id = "Qwen/Qwen2.5-VL-7B-Instruct"
-local_dir = os.environ["MODEL_DIR"]
+repo_id = os.environ.get("MODEL_REPO", "Qwen/Qwen3-VL-8B-Instruct")
+local_dir = os.environ["MODEL_DIR_PATH"]
 
 snapshot_download(
     repo_id=repo_id,
     local_dir=local_dir,
     local_dir_use_symlinks=False,
-    resume_download=True,
 )
 print(f"[MODEL] snapshot_download done: {local_dir}")
 PY

@@ -360,6 +360,10 @@ class CEDExperiment:
                  dtype=torch.bfloat16):
         log.info(f"Loading model from {model_path} ...")
         from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+except Exception:
+    Qwen3VLForConditionalGeneration = None
 
         self.device = torch.device(device)
         self.dtype = dtype
@@ -369,12 +373,20 @@ class CEDExperiment:
         # If your environment has FlashAttention2 properly installed,
         # you can override with ATTN_IMPL=flash_attention_2.
         attn_impl = os.environ.get("ATTN_IMPL", "sdpa")
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map=device,
-            attn_implementation=attn_impl,
-        )
+        # Load config first to choose correct class (Qwen2.5-VL vs Qwen3-VL)
+cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+model_cls = Qwen2VLForConditionalGeneration
+if getattr(cfg, "model_type", "") == "qwen3_vl" and Qwen3VLForConditionalGeneration is not None:
+    model_cls = Qwen3VLForConditionalGeneration
+
+self.model = model_cls.from_pretrained(
+
+        model_path,
+        torch_dtype=dtype,
+        device_map=device,
+        attn_implementation=attn_impl,
+
+)
         self.model.eval()
 
         # Token IDs
