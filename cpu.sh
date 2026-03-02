@@ -3,6 +3,14 @@
 # CPU Server Download Script for CED Phase 0
 # Run on CPU server (has internet access)
 # ============================================================================
+# Notes:
+# - COCO downloads can be slow from some regions. This script:
+#   * Prefers aria2c multi-connection download (respects datacenter proxy env)
+#   * Forces IPv4 (often fixes slow IPv6 route issues)
+#   * Supports resume/continue
+# - This script DOES NOT copy/rename itself (to avoid git/versioning side-effects).
+#   You decide where to place it in your repo.
+# ============================================================================
 
 set -e
 
@@ -29,12 +37,9 @@ mkdir -p "${CODE_DIR}"
 
 # -------------------------------------------------------------------
 # Step 1: Create conda environment
-#   - Use --prefix so env lives on shared filesystem (both CPU & GPU can see it)
-#   - Use --override-channels -c defaults to force official Anaconda channel
 # -------------------------------------------------------------------
 echo "[1/5] Creating conda environment..."
 
-# Initialize conda for current shell
 __conda_setup="$('conda' 'shell.bash' 'hook' 2>/dev/null)"
 if [ $? -eq 0 ]; then
     eval "$__conda_setup"
@@ -60,21 +65,10 @@ else
         -y
 fi
 
-# Activate via prefix path (works regardless of envs_dirs config)
 conda activate "${ENV_DIR}"
-
-# Verify we're in the right env (NOT system base)
-ACTUAL_PYTHON=$(which python)
-if [[ "${ACTUAL_PYTHON}" != "${ENV_DIR}"* ]]; then
-    echo "WARNING: python resolves to ${ACTUAL_PYTHON}, expected ${ENV_DIR}/bin/python"
-    echo "         Trying direct path activation..."
-    export PATH="${ENV_DIR}/bin:$PATH"
-    export CONDA_PREFIX="${ENV_DIR}"
-fi
 echo "Activated: $(which python)"
 echo "Python:   $(python --version)"
 
-# Upgrade pip from official source
 pip install --upgrade pip \
     -i https://pypi.org/simple/ \
     --trusted-host pypi.org
@@ -99,7 +93,7 @@ pip download \
     "transformers==4.48.3" \
     "accelerate==1.3.0" \
     "qwen-vl-utils==0.0.10" \
-    "huggingface-hub==0.27.1" \
+    "huggingface-hub==0.28.1" \
     "safetensors==0.5.2" \
     "tokenizers==0.21.0" \
     "sentencepiece==0.2.0" \
@@ -128,54 +122,77 @@ echo "Downloaded $(ls ${PKG}/ | wc -l) package files to ${PKG}/"
 # -------------------------------------------------------------------
 echo "[3/5] Downloading Qwen2.5-VL-7B-Instruct..."
 
-# Verify we are using the conda env's python, NOT system base
-echo "  which python: $(which python)"
-echo "  python version: $(python --version)"
-echo "  which pip: $(which pip)"
-
 MODEL_DIR="${BASE_DIR}/models/Qwen2.5-VL-7B-Instruct"
 if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/config.json" ]; then
     echo "Model already exists, skipping."
 else
-    # Install/upgrade huggingface_hub in our conda env
-    pip install --upgrade "huggingface-hub>=0.27.1" \
-        -i "${PYPI}" --trusted-host pypi.org
-
-    # --- KEY FIXES for corporate network ---
-    # 1. Disable xet storage protocol (causes SSL errors behind proxy/firewall)
-    export HF_HUB_ENABLE_HF_TRANSFER=0
-    export HF_HUB_DISABLE_XET=1
-
-    # 2. If SSL still fails, uncomment the next two lines:
-    # export CURL_CA_BUNDLE=""
-    # export REQUESTS_CA_BUNDLE=""
-
-    # 3. Use python -m to guarantee we call OUR env's huggingface-cli
-    python -m huggingface_hub.commands.huggingface_cli download \
+    # Ensure huggingface-cli available (pin to match offline wheelhouse)
+    pip install "huggingface-hub==0.28.1" -i "${PYPI}" --trusted-host pypi.org
+    huggingface-cli download \
         Qwen/Qwen2.5-VL-7B-Instruct \
         --local-dir "${MODEL_DIR}" \
         --local-dir-use-symlinks False
-
-    # If the above still fails with SSL, try the fallback:
-    # python -c "
-    # import os
-    # os.environ['HF_HUB_DISABLE_XET'] = '1'
-    # from huggingface_hub import snapshot_download
-    # snapshot_download(
-    #     'Qwen/Qwen2.5-VL-7B-Instruct',
-    #     local_dir='${MODEL_DIR}',
-    #     local_dir_use_symlinks=False,
-    # )
-    # "
 fi
 echo "Model ready at ${MODEL_DIR}"
 
 # -------------------------------------------------------------------
 # Step 4: Download COCO val2017
+#   - Prefer aria2c multi-connection
+#   - Force IPv4 (avoid slow IPv6 routes)
+#   - Keep using datacenter proxy env (http_proxy/https_proxy/all_proxy)
 # -------------------------------------------------------------------
 echo "[4/5] Downloading COCO val2017..."
 
 COCO_DIR="${BASE_DIR}/data/coco"
+COCO_ZIP_URL="http://images.cocodataset.org/zips/val2017.zip"
+COCO_ANN_ZIP_URL="http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+
+COCO_CONN="${COCO_CONN:-16}"   # override: export COCO_CONN=8
+
+ensure_aria2c() {
+    if command -v aria2c >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "aria2c not found; trying to install (best-effort)..."
+    if command -v apt-get >/dev/null 2>&1; then
+        (sudo -n true >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y aria2) || \
+        (apt-get update && apt-get install -y aria2) || true
+    fi
+    if ! command -v aria2c >/dev/null 2>&1 && command -v conda >/dev/null 2>&1; then
+        conda install -y -c conda-forge aria2 || true
+    fi
+    command -v aria2c >/dev/null 2>&1
+}
+
+download_file() {
+    local url="$1"
+    local out="$2"
+
+    if ensure_aria2c; then
+        # aria2c respects env proxies; also pass ALL_PROXY/all_proxy if present
+        local proxy_arg=""
+        if [ -n "${all_proxy}" ]; then
+            proxy_arg="--all-proxy=${all_proxy}"
+        elif [ -n "${ALL_PROXY}" ]; then
+            proxy_arg="--all-proxy=${ALL_PROXY}"
+        fi
+
+        echo "Downloading with aria2c (connections=${COCO_CONN}, IPv4 only): ${url}"
+        aria2c \
+            --continue=true \
+            --max-connection-per-server="${COCO_CONN}" \
+            -x"${COCO_CONN}" -s"${COCO_CONN}" \
+            -k1M \
+            --disable-ipv6=true \
+            --file-allocation=none \
+            ${proxy_arg} \
+            -o "${out}" \
+            "${url}"
+    else
+        echo "Downloading with wget (IPv4 only): ${url}"
+        wget -4 -c "${url}" -O "${out}"
+    fi
+}
 
 # Images
 if [ -d "${COCO_DIR}/images/val2017" ] && [ $(ls "${COCO_DIR}/images/val2017" 2>/dev/null | wc -l) -gt 4000 ]; then
@@ -183,7 +200,7 @@ if [ -d "${COCO_DIR}/images/val2017" ] && [ $(ls "${COCO_DIR}/images/val2017" 2>
 else
     echo "Downloading val2017 images (~6GB)..."
     cd "${COCO_DIR}/images"
-    wget -c http://images.cocodataset.org/zips/val2017.zip -O val2017.zip
+    download_file "${COCO_ZIP_URL}" "val2017.zip"
     unzip -o val2017.zip
     rm -f val2017.zip
 fi
@@ -194,18 +211,19 @@ if [ -f "${COCO_DIR}/annotations/instances_val2017.json" ]; then
 else
     echo "Downloading annotations..."
     cd "${COCO_DIR}"
-    wget -c http://images.cocodataset.org/annotations/annotations_trainval2017.zip -O annotations.zip
+    download_file "${COCO_ANN_ZIP_URL}" "annotations.zip"
     unzip -o annotations.zip
     rm -f annotations.zip
 fi
 
 # -------------------------------------------------------------------
-# Step 5: Copy code to shared filesystem
+# Step 5: Copy code to shared filesystem (ONLY main.py & gpu.sh)
+#   - Keep cpu.sh out to avoid messing with your git workflow.
 # -------------------------------------------------------------------
-echo "[5/5] Copying code files..."
+echo "[5/5] Copying code files (main.py, gpu.sh)..."
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-for f in main.py gpu.sh cpu.sh; do
+for f in main.py gpu.sh; do
     if [ -f "${SCRIPT_DIR}/${f}" ]; then
         cp "${SCRIPT_DIR}/${f}" "${CODE_DIR}/${f}"
         echo "  Copied ${f} -> ${CODE_DIR}/"

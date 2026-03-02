@@ -62,15 +62,6 @@ fi
 
 # Activate via full prefix path (no need for env name lookup)
 conda activate "${ENV_DIR}"
-
-# Verify we're in the right env (NOT system base)
-ACTUAL_PYTHON=$(which python)
-if [[ "${ACTUAL_PYTHON}" != "${ENV_DIR}"* ]]; then
-    echo "WARNING: python resolves to ${ACTUAL_PYTHON}, expected ${ENV_DIR}/bin/python"
-    echo "         Falling back to direct PATH manipulation..."
-    export PATH="${ENV_DIR}/bin:$PATH"
-    export CONDA_PREFIX="${ENV_DIR}"
-fi
 echo "  Python: $(which python) -> $(python --version)"
 
 # -------------------------------------------------------------------
@@ -91,7 +82,7 @@ pip install --no-index --find-links="${PACKAGES_DIR}" \
     transformers==4.48.3 \
     accelerate==1.3.0 \
     qwen-vl-utils==0.0.10 \
-    huggingface-hub==0.27.1 \
+    huggingface-hub==0.28.1 \
     safetensors==0.5.2 \
     tokenizers==0.21.0 \
     sentencepiece==0.2.0 \
@@ -134,7 +125,9 @@ cd "${CODE_DIR}"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
-export HF_HUB_DISABLE_XET=1
+
+# Prefer portable attention backend (can override in env if desired)
+export ATTN_IMPL=sdpa
 
 # Single GPU is sufficient for P0
 export CUDA_VISIBLE_DEVICES=0

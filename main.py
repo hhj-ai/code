@@ -247,11 +247,24 @@ def prepare_samples(coco: COCO, img_dir: str, num_samples: int = 500,
             absent = [c for c in COMMON_CATEGORIES if c not in present_cats]
             if absent:
                 neg_cat = rng.choice(absent)
+
+                # For negative samples we still need a region to perturb,
+                # otherwise CED metrics would be skipped downstream.
+                # Use a deterministic random patch (covers ~35% of the image)
+                # so that replacement is well-defined and surround tokens exist.
+                neg_w = max(64, int(0.35 * W_orig))
+                neg_h = max(64, int(0.35 * H_orig))
+                neg_w = min(neg_w, W_orig)
+                neg_h = min(neg_h, H_orig)
+                x0 = rng.randint(0, max(0, W_orig - neg_w))
+                y0 = rng.randint(0, max(0, H_orig - neg_h))
+                neg_bbox = [x0, y0, neg_w, neg_h]
+
                 samples["existence"].append({
                     "img_id": img_id, "img_path": img_path,
                     "image_size": (W_orig, H_orig),
                     "question": f"Is there a {neg_cat} in this image? Answer yes or no.",
-                    "answer_gt": "no", "target_bbox": None,
+                    "answer_gt": "no", "target_bbox": neg_bbox,
                     "category": neg_cat, "task": "existence",
                 })
 
@@ -352,11 +365,15 @@ class CEDExperiment:
         self.dtype = dtype
 
         self.processor = AutoProcessor.from_pretrained(model_path)
+        # Prefer SDPA for maximum portability across clusters.
+        # If your environment has FlashAttention2 properly installed,
+        # you can override with ATTN_IMPL=flash_attention_2.
+        attn_impl = os.environ.get("ATTN_IMPL", "sdpa")
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=dtype,
             device_map=device,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
         self.model.eval()
 
