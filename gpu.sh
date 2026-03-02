@@ -60,9 +60,38 @@ else
     fi
 fi
 
-# Activate via full prefix path (no need for env name lookup)
+
+# Clean up possibly nested / conflicting conda activations (common on clusters)
+conda deactivate 2>/dev/null || true
+conda deactivate 2>/dev/null || true
+
+# Activate via full prefix path (do NOT rely on env name)
 conda activate "${ENV_DIR}"
 echo "  Python: $(which python) -> $(python --version)"
+
+# Sanity-check that we are really inside the intended prefix env
+echo "  CONDA_PREFIX: ${CONDA_PREFIX}"
+if [ "${CONDA_PREFIX}" != "${ENV_DIR}" ]; then
+    echo "ERROR: conda activated a different prefix than expected!"
+    echo "       Expected: ${ENV_DIR}"
+    echo "       Got:      ${CONDA_PREFIX}"
+    echo "       Fix your conda init/modules; aborting to avoid mixed CUDA libs."
+    exit 1
+fi
+python -c "import sys,os; print('  sys.executable:', sys.executable); print('  python:', sys.version.split()[0])"
+
+# CUDA dynamic library fix:
+# Prefer the nvjitlink bundled with the PyTorch CUDA12 wheels over system /usr/local/cuda libs.
+# This avoids: __nvJitLinkComplete_12_4 ... not defined in file libnvJitLink.so.12
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/nvjitlink/lib:${LD_LIBRARY_PATH}"
+# (Optional hardening) also prefer bundled cuSPARSE/cuBLAS if present
+if [ -d "${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cusparse/lib" ]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cusparse/lib:${LD_LIBRARY_PATH}"
+fi
+if [ -d "${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cublas/lib" ]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cublas/lib:${LD_LIBRARY_PATH}"
+fi
+
 
 # -------------------------------------------------------------------
 # Step 2: Install packages from local wheels (fully offline)
@@ -82,7 +111,7 @@ pip install --no-index --find-links="${PACKAGES_DIR}" \
     transformers==4.48.3 \
     accelerate==1.3.0 \
     qwen-vl-utils==0.0.10 \
-    huggingface-hub==0.28.1 \
+    huggingface-hub==0.27.1 \
     safetensors==0.5.2 \
     tokenizers==0.21.0 \
     sentencepiece==0.2.0 \
@@ -125,9 +154,6 @@ cd "${CODE_DIR}"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
-
-# Prefer portable attention backend (can override in env if desired)
-export ATTN_IMPL=sdpa
 
 # Single GPU is sufficient for P0
 export CUDA_VISIBLE_DEVICES=0
