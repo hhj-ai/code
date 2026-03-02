@@ -1,28 +1,71 @@
-#!/usr/bin/env bash
-set -euo pipefail
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-# 直接用 conda 环境的绝对路径 python（不需要 conda activate）
-CED_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0"
-PY="$CED_ENV/bin/python"
+    # 强制使用 conda 环境的绝对路径 python（不依赖 conda activate）
+    CED_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0"
+    PY="$CED_ENV/bin/python"
 
-if [ ! -x "$PY" ]; then
-  echo "[FATAL] Python not found or not executable: $PY" >&2
-  echo "Check your conda env path: $CED_ENV" >&2
-  exit 1
-fi
+    if [ -z "${BASH_VERSION:-}" ]; then
+      echo "[FATAL] 请用 bash 运行：bash cpu.sh（不要用 sh cpu.sh）" >&2
+      exit 2
+    fi
 
-# （可选）把 HF 缓存放到项目可控目录，避免写到 ~/.cache
-export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+    if [ ! -x "$PY" ]; then
+      echo "[FATAL] Python not found or not executable: $PY" >&2
+      exit 1
+    fi
 
-MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct}"
-LOCAL_DIR="${LOCAL_DIR:-$PWD/models/Qwen2.5-VL-7B-Instruct}"
-CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
+    # CPU 跑也建议显式禁用可见 GPU
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 
-"$PY" -u main.py \
-  --repo-id "$MODEL_ID" \
-  --local-dir "$LOCAL_DIR" \
-  --cache-dir "$CACHE_DIR" \
-  --device cpu \
-  --dtype float32
+
+# Build LD_LIBRARY_PATH so that conda env bundled NVIDIA libs are preferred.
+# This often fixes: libcusparse.so.12 ... __nvJitLinkComplete_12_4 ... not defined ...
+add_lib_dir () {
+  local d="$1"
+  if [ -d "$d" ]; then
+    if [[ ":${LD_LIBRARY_PATH:-}:" != *":$d:"* ]]; then
+      export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+  fi
+}
+
+# 1) basic conda env libs
+add_lib_dir "$CED_ENV/lib"
+
+# 2) torch bundled libs
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/torch/lib"
+
+# 3) pip nvidia libs (names used by PyTorch wheels)
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/nvjitlink/lib"
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cusparse/lib"
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cublas/lib"
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
+add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
+
+
+    # （可选）把 HF 缓存放到项目可控目录，避免写到 ~/.cache
+    export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
+    export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+    export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+
+    MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct}"
+    LOCAL_DIR="${LOCAL_DIR:-$PWD/models/Qwen2.5-VL-7B-Instruct}"
+    CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
+
+    # 如果你只想下载（绕开 torch import），用：DOWNLOAD_ONLY=1 bash cpu.sh
+    if [ "${DOWNLOAD_ONLY:-0}" = "1" ]; then
+      "$PY" -u main.py \
+        --repo-id "$MODEL_ID" \
+        --local-dir "$LOCAL_DIR" \
+        --cache-dir "$CACHE_DIR" \
+        --download-only
+      exit 0
+    fi
+
+    "$PY" -u main.py \
+      --repo-id "$MODEL_ID" \
+      --local-dir "$LOCAL_DIR" \
+      --cache-dir "$CACHE_DIR" \
+      --device cpu \
+      --dtype float32
