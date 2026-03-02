@@ -154,9 +154,22 @@ if [ ${need_download} -eq 0 ]; then
 else
   echo "[MODEL] downloading/resuming to ${MODEL_DIR} ..."
   if command -v hf >/dev/null 2>&1; then
-    hf download Qwen/Qwen2.5-VL-7B-Instruct \
-      --local-dir "${MODEL_DIR}" \
-      --local-dir-use-symlinks False
+    # Use Python API to control local_dir_use_symlinks (hf CLI doesn't expose it).
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+repo_id = "Qwen/Qwen2.5-VL-7B-Instruct"
+local_dir = os.environ["MODEL_DIR"]
+
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=local_dir,
+    local_dir_use_symlinks=False,
+    resume_download=True,
+)
+print(f"[MODEL] snapshot_download done: {local_dir}")
+PY
   else
     # Backward-compatible CLI (still works even if deprecated)
     huggingface-cli download \
