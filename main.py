@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""main.py
+
+特点：
+- 下载 Hugging Face Hub 模型到本地目录（不使用已不兼容的 --local-dir-use-symlinks）
+- 加载 Qwen2.5-VL / Qwen3-VL 等多模态模型更鲁棒：
+  - Qwen3VLConfig 没有顶层 num_hidden_layers 时，会从 text_config/llm_config 等位置读取
+  - ignore_mismatched_sizes=True，避免常见的视觉 pos_embed 等尺寸不匹配直接报错
+- 兼容 Python 3.8+（避免 list[str] 这种 3.9+ 语法）
 """
-Layout-compatible runner:
-- Downloads a HF model repo to a local directory (no deprecated --local-dir-use-symlinks flag)
-- Loads Qwen2.5-VL / Qwen3-VL style models robustly
-- Fixes: Qwen3VLConfig has no config.num_hidden_layers -> use config.text_config.num_hidden_layers, etc.
-- Mitigates: visual pos_embed shape mismatch via ignore_mismatched_sizes=True
-"""
+
+from __future__ import annotations
 
 import os
 import sys
 import argparse
 import subprocess
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 
 import torch
 from huggingface_hub import snapshot_download
@@ -21,7 +25,7 @@ from transformers import AutoProcessor
 
 # Prefer the correct multimodal auto-model if available
 try:
-    from transformers import AutoModelForVision2Seq  # Qwen2.5-VL uses this in recent Transformers
+    from transformers import AutoModelForVision2Seq  # recent transformers
     _HAS_V2S = True
 except Exception:
     _HAS_V2S = False
@@ -29,21 +33,21 @@ except Exception:
 from transformers import AutoModelForCausalLM
 
 
-def _run(cmd: list[str]) -> None:
-    """Run a shell command and stream output; raise on failure."""
+def _run(cmd: List[str]) -> None:
+    """Run a shell command; raise on failure."""
     print("[CMD]", " ".join(cmd), flush=True)
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     print(p.stdout, flush=True)
     if p.returncode != 0:
-        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}")
+        raise RuntimeError("Command failed ({}): {}".format(p.returncode, " ".join(cmd)))
 
 
 def ensure_downloaded(repo_id_or_path: str, local_dir: str, cache_dir: Optional[str]) -> str:
     """
     Ensure model weights exist locally.
-    If repo_id_or_path is an existing directory -> use it.
-    Else try `hf download ... --local-dir ...` (no deprecated flags).
-    If CLI fails, fall back to huggingface_hub.snapshot_download().
+    - If repo_id_or_path is a local directory -> return it.
+    - Else try `hf download ... --local-dir ...` (no deprecated flags).
+    - If CLI fails, fall back to huggingface_hub.snapshot_download().
     """
     if os.path.isdir(repo_id_or_path):
         return repo_id_or_path
@@ -62,32 +66,36 @@ def ensure_downloaded(repo_id_or_path: str, local_dir: str, cache_dir: Optional[
     if has_weights(local_dir) and os.path.exists(os.path.join(local_dir, "config.json")):
         return local_dir
 
-    # 1) Try hf CLI (huggingface_hub)
+    # 1) Try hf CLI (works if `hf` is installed)
     try:
         cmd = ["hf", "download", repo_id_or_path, "--repo-type", "model", "--local-dir", local_dir]
         if cache_dir:
             cmd += ["--cache-dir", cache_dir]
-        # Some versions support this; if not, we'll fall back
+        # some versions support resume; if not, this will error and we fall back
         cmd += ["--resume-download"]
         _run(cmd)
         if has_weights(local_dir):
             return local_dir
     except Exception as e:
-        print(f"[WARN] hf CLI download failed, falling back to snapshot_download(): {e}", file=sys.stderr)
+        print("[WARN] hf CLI download failed; fallback to snapshot_download(): {}".format(e), file=sys.stderr)
 
-    # 2) Python fallback: snapshot_download (always resumes when possible in recent hub versions)
-    kwargs = dict(
+    # 2) Python fallback
+    kwargs: Dict[str, Any] = dict(
         repo_id=repo_id_or_path,
         repo_type="model",
         local_dir=local_dir,
-        local_dir_use_symlinks=False,  # safe even if deprecated; ignored by newer versions
     )
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
 
-    snapshot_download(**kwargs)
+    # `local_dir_use_symlinks` 可能在不同版本被改动；安全处理
+    try:
+        snapshot_download(local_dir_use_symlinks=False, **kwargs)  # type: ignore
+    except TypeError:
+        snapshot_download(**kwargs)
+
     if not has_weights(local_dir):
-        raise RuntimeError(f"Download finished but no weights found in: {local_dir}")
+        raise RuntimeError("Download finished but no weights found in: {}".format(local_dir))
     return local_dir
 
 
@@ -126,14 +134,14 @@ def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
 
     if dtype == "auto":
-        if device.startswith("cuda"):
+        if device.startswith("cuda") and torch.cuda.is_available():
             torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
             torch_dtype = torch.float32
     else:
         torch_dtype = getattr(torch, dtype)
 
-    device_map = "auto" if device.startswith("cuda") else None
+    device_map = "auto" if (device.startswith("cuda") and torch.cuda.is_available()) else None
 
     if _HAS_V2S:
         model = AutoModelForVision2Seq.from_pretrained(
@@ -164,8 +172,6 @@ class CEDExperiment:
     def __init__(self, model_path: str, device: str = "cuda:0", dtype: str = "auto", trust_remote_code: bool = True):
         self.device = device
         self.processor, self.model = load_model(model_path, device=device, dtype=dtype, trust_remote_code=trust_remote_code)
-
-        # ✅ FIX: Qwen3VLConfig doesn't have config.num_hidden_layers at top level
         self.num_layers = _get_num_hidden_layers(self.model.config, self.model)
 
     @torch.no_grad()
@@ -194,20 +200,20 @@ def main():
     args = parse_args()
 
     model_path = ensure_downloaded(args.repo_id, args.local_dir, args.cache_dir)
-    print(f"[OK] Model files ready at: {model_path}", flush=True)
+    print("[OK] Model files ready at: {}".format(model_path), flush=True)
 
     if args.download_only:
         return
 
     exp = CEDExperiment(model_path, device=args.device, dtype=args.dtype, trust_remote_code=args.trust_remote_code)
-    print(f"[OK] Loaded model. num_layers = {exp.num_layers}", flush=True)
+    print("[OK] Loaded model. num_layers = {}".format(exp.num_layers), flush=True)
 
     if args.smoke_test:
         try:
             txt = exp.smoke_test_text("Hello World")
             print("[SMOKE_TEST_OUTPUT]", txt, flush=True)
         except Exception as e:
-            print(f"[WARN] smoke test failed (model still loaded): {e}", file=sys.stderr)
+            print("[WARN] smoke test failed (model still loaded): {}".format(e), file=sys.stderr)
 
 
 if __name__ == "__main__":
