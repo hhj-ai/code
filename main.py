@@ -356,37 +356,48 @@ def prepare_samples(coco: COCO, img_dir: str, num_samples: int = 500,
 class CEDExperiment:
     """Handles model loading, visual token replacement, and CED computation."""
 
-    def __init__(self, model_path: str, device: str = "cuda:0",
-                 dtype=torch.bfloat16):
+    def __init__(self, model_path: str, device: str = "cuda:0", dtype=torch.bfloat16):
         log.info(f"Loading model from {model_path} ...")
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-try:
-    from transformers import Qwen3VLForConditionalGeneration
-except Exception:
-    Qwen3VLForConditionalGeneration = None
+
+        # Transformers imports (kept local to reduce import-time side effects).
+        from transformers import AutoProcessor, AutoConfig
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+        except Exception:
+            Qwen3VLForConditionalGeneration = None
+        try:
+            from transformers import Qwen2VLForConditionalGeneration
+        except Exception:
+            # Some versions expose the class as Qwen2_5_VL*; fall back to AutoModel if needed.
+            Qwen2VLForConditionalGeneration = None
+            from transformers import AutoModelForCausalLM as _AutoModelForCausalLM
 
         self.device = torch.device(device)
         self.dtype = dtype
 
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        # Prefer SDPA for maximum portability across clusters.
-        # If your environment has FlashAttention2 properly installed,
-        # you can override with ATTN_IMPL=flash_attention_2.
+        # Processor (tokenizer + image processor)
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
+        # Prefer SDPA for portability; override with ATTN_IMPL=flash_attention_2 if available.
         attn_impl = os.environ.get("ATTN_IMPL", "sdpa")
-        # Load config first to choose correct class (Qwen2.5-VL vs Qwen3-VL)
-cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-model_cls = Qwen2VLForConditionalGeneration
-if getattr(cfg, "model_type", "") == "qwen3_vl" and Qwen3VLForConditionalGeneration is not None:
-    model_cls = Qwen3VLForConditionalGeneration
 
-self.model = model_cls.from_pretrained(
+        # Choose the correct model class based on config.model_type
+        cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        model_type = getattr(cfg, "model_type", "")
+        if model_type == "qwen3_vl" and Qwen3VLForConditionalGeneration is not None:
+            model_cls = Qwen3VLForConditionalGeneration
+        elif Qwen2VLForConditionalGeneration is not None:
+            model_cls = Qwen2VLForConditionalGeneration
+        else:
+            model_cls = _AutoModelForCausalLM
 
-        model_path,
-        torch_dtype=dtype,
-        device_map=device,
-        attn_implementation=attn_impl,
-
-)
+        self.model = model_cls.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map=device,
+            attn_implementation=attn_impl,
+            trust_remote_code=True,
+        )
         self.model.eval()
 
         # Token IDs
