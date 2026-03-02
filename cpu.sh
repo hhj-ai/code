@@ -1,7 +1,6 @@
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # ✅ 不用 conda activate，直接用 env 的 python 绝对路径
     CED_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0"
     PY="$CED_ENV/bin/python"
     if [ ! -x "$PY" ]; then
@@ -9,7 +8,6 @@
       exit 1
     fi
 
-    # ✅ 让 env 内 CUDA 相关 so 优先生效（避免系统库抢先被加载）
 
 add_lib_dir () {
   local d="$1"
@@ -28,20 +26,19 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
 
-    # ✅ HF 缓存建议放到项目目录（可控、可迁移）
     export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
     export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
     export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 
-    # ✅ 默认自动找本地 Qwen3-VL（找不到才下载 fallback）
     MODEL_ID="${MODEL_ID:-auto}"
     LOCAL_DIR="${LOCAL_DIR:-$PWD/../dataprepare/models/Qwen3-VL-8B-Instruct}"
     CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
     FALLBACK_REPO="${FALLBACK_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
 
-    # 只下载不加载（规避 torch/CUDA so 问题）：DOWNLOAD_ONLY=1 bash cpu.sh
-    if [ "${DOWNLOAD_ONLY:-0}" = "1" ]; then
-      "$PY" -u main_v7.py \
+    # ✅ v8 改动：CPU 默认只做下载/复用检查，避免 8B fp32 直接 OOM 被 kill
+    if [ "${RUN_CPU_LOAD:-0}" != "1" ]; then
+      echo "[INFO] CPU 默认不加载 8B 模型（容易 OOM 被 kill）。如需强制 CPU 加载，设置 RUN_CPU_LOAD=1。" >&2
+      "$PY" -u main.py \
         --repo-id "$MODEL_ID" \
         --local-dir "$LOCAL_DIR" \
         --cache-dir "$CACHE_DIR" \
@@ -50,10 +47,22 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
       exit 0
     fi
 
+    # ✅ 强制 CPU 加载：默认 bfloat16 + 可选磁盘 offload
+    CPU_DTYPE="${CPU_DTYPE:-bfloat16}"
+    # 例如：MAX_CPU_MEM=24GiB OFFLOAD_FOLDER=$PWD/.offload_cpu RUN_CPU_LOAD=1 bash cpu.sh
+    MAX_CPU_MEM="${MAX_CPU_MEM:-}"
+    OFFLOAD_FOLDER="${OFFLOAD_FOLDER:-$PWD/.offload_cpu}"
+
+    EXTRA=()
+    if [ -n "$MAX_CPU_MEM" ]; then
+      EXTRA+=(--device-map auto --max-cpu-mem "$MAX_CPU_MEM" --offload-folder "$OFFLOAD_FOLDER")
+    fi
+
     "$PY" -u main.py \
       --repo-id "$MODEL_ID" \
       --local-dir "$LOCAL_DIR" \
       --cache-dir "$CACHE_DIR" \
       --fallback-repo "$FALLBACK_REPO" \
       --device cpu \
-      --dtype float32
+      --dtype "$CPU_DTYPE" \
+      "${EXTRA[@]}"

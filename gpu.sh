@@ -35,7 +35,6 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
     CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
     FALLBACK_REPO="${FALLBACK_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
 
-    # 可选：export CUDA_VISIBLE_DEVICES=0
     "$PY" -u main.py \
       --repo-id "$MODEL_ID" \
       --local-dir "$LOCAL_DIR" \
