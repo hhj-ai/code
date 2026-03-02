@@ -18,8 +18,8 @@ BASE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangman
 ENV_DIR="${BASE_DIR}/conda_envs/ced_p0"
 WHEELHOUSE="${BASE_DIR}/packages"
 HF_HOME="${BASE_DIR}/.hf_cache"
-MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
-MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
+export MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
+export MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
 
 # ---- Force OFFICIAL PyPI (ignore company/internal pip config) ----
 export PIP_CONFIG_FILE="/dev/null"
@@ -97,8 +97,10 @@ python - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
-repo_id = os.environ["MODEL_REPO"]
-local_dir = os.environ["MODEL_DIR"]
+repo_id = os.environ.get("MODEL_REPO")
+local_dir = os.environ.get("MODEL_DIR")
+if not repo_id or not local_dir:
+    raise RuntimeError(f"MODEL_REPO/MODEL_DIR not set in env: MODEL_REPO={repo_id}, MODEL_DIR={local_dir}")
 snapshot_download(repo_id=repo_id, local_dir=local_dir, local_dir_use_symlinks=False)
 print("[CPU] snapshot_download done:", repo_id, "->", local_dir)
 PY

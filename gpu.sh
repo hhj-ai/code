@@ -16,8 +16,8 @@ CODE_DIR="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangman
 ENV_DIR="${BASE_DIR}/conda_envs/ced_p0"
 WHEELHOUSE="${BASE_DIR}/packages"
 
-MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
-MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
+export MODEL_REPO="${MODEL_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
+export MODEL_DIR="${BASE_DIR}/models/$(basename "${MODEL_REPO}")"
 COCO_IMG_DIR="${BASE_DIR}/data/coco/images/val2017"
 COCO_ANN_FILE="${BASE_DIR}/data/coco/annotations/instances_val2017.json"
 OUT_DIR="${CODE_DIR}/results_p0"
