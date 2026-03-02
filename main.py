@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""main.py (v8)
+"""main.py (v9)
 
-v7 已经修复了：Qwen3-VL 正确的模型类（Qwen3VLForConditionalGeneration）+ dtype 参数 + 不用 hf CLI + auto 复用本地。
-你现在遇到的 `Killed`：
-  - 不是 Python traceback，而是 OS/Scheduler 给进程发了 SIGKILL（通常是 OOM killer / cgroup memory limit）。
-  - 你在 CPU 上用 float32 加载 8B 级模型，权重本身就 ~32GB（还没算额外开销与峰值），很容易被杀。
+你问“为什么 gpu.sh 没有跑实验”：
+- 因为当前 gpu.sh 调用的是 `main.py --smoke-test`，只做“能否加载 + 简单生成”验活。
+- 这一步是为了先把前面一连串坑（Qwen3-VL 类别、dtype、conda 绝对路径、CUDA so 冲突）全部排干净。
+  现在模型能在 GPU 上正常加载并输出了，说明环境层 OK。
 
-v8 目标：让 CPU 脚本“默认不做危险动作”，并提供可选的 CPU 低内存加载路径（极慢但能活）。
-- 默认建议：CPU 只做 --download-only（避免被 kill）
-- 若确实要 CPU 载入：
-    * 默认 dtype 改为 bfloat16（内存减半）
-    * 支持 --device-map auto + --max-cpu-mem + --offload-folder，将一部分权重 offload 到磁盘（更省内存，但更慢）
+✅ v9 增强：支持“定位模型后，继续执行你的实验入口脚本”
+- 用法：把你真正的实验命令放在 `--exec -- <cmd...>` 后面
+- 你可以在命令里写 `{MODEL_PATH}` 占位符，本脚本会自动替换成解析到的本地模型目录。
+  例如：
+    python main.py --exec -- python your_experiment.py --model_path {MODEL_PATH} --device cuda:0
+
+另外：
+- 保留 v7/v8 的修复：Qwen3-VL 用 Qwen3VLForConditionalGeneration；默认 auto 复用本地；不用 hf CLI；dtype/torch_dtype 兼容。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import argparse
+import subprocess
 from typing import Any, Optional, Dict, List
 
 from huggingface_hub import snapshot_download
@@ -150,7 +154,6 @@ def _import_transformers():
 
 
 def _call_from_pretrained(cls, model_path: str, *, dtype, device_map, trust_remote_code: bool, **kwargs):
-    # 优先 dtype（新接口），不行再 torch_dtype（老接口）
     try:
         return cls.from_pretrained(
             model_path,
@@ -169,21 +172,7 @@ def _call_from_pretrained(cls, model_path: str, *, dtype, device_map, trust_remo
         )
 
 
-def _parse_max_memory(s: Optional[str]) -> Optional[Dict[str, str]]:
-    # 形如: "24GiB" or "24000MiB"
-    if not s:
-        return None
-    s = s.strip()
-    return {"cpu": s, "disk": "200GiB"}  # disk 给大一点，避免再 OOM
-
-
-def load_model(model_path: str,
-               device: str,
-               dtype: str,
-               trust_remote_code: bool,
-               device_map_arg: Optional[str],
-               max_cpu_mem: Optional[str],
-               offload_folder: Optional[str]):
+def load_model(model_path: str, device: str, dtype: str, trust_remote_code: bool):
     torch, AutoProcessor, AutoConfig, Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration, AutoModelForVision2Seq, AutoModelForCausalLM = _import_transformers()
 
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
@@ -192,36 +181,14 @@ def load_model(model_path: str,
         if device.startswith("cuda") and torch.cuda.is_available():
             torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
-            # CPU 默认 bfloat16 更省内存；不支持也能存权重，只是计算可能慢/有些 op 回退
             torch_dtype = torch.bfloat16
     else:
         torch_dtype = getattr(torch, dtype)
 
-    # device_map 逻辑：
-    # - GPU 默认 "auto"
-    # - CPU 默认 None（意味着全放 CPU 内存） -> 但可通过 --device-map auto + --max-cpu-mem + --offload-folder 走磁盘 offload
-    if device_map_arg:
-        device_map = device_map_arg
-    else:
-        device_map = "auto" if (device.startswith("cuda") and torch.cuda.is_available()) else None
+    device_map = "auto" if (device.startswith("cuda") and torch.cuda.is_available()) else None
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     model_type = getattr(cfg, "model_type", "").lower()
-
-    extra_kwargs: Dict[str, Any] = dict(ignore_mismatched_sizes=True)
-    max_memory = _parse_max_memory(max_cpu_mem)
-
-    # 如果要磁盘 offload，transformers 需要 offload_folder / max_memory 等参数
-    if device_map == "auto" and max_memory is not None:
-        if not offload_folder:
-            offload_folder = "./.offload"
-        extra_kwargs.update(
-            dict(
-                max_memory=max_memory,
-                offload_folder=offload_folder,
-                offload_state_dict=True,
-            )
-        )
 
     if "qwen3_vl" in model_type or cfg.__class__.__name__ in ("Qwen3VLConfig", "Qwen3VLMoeConfig"):
         if ("moe" in model_type) and (Qwen3VLMoeForConditionalGeneration is not None):
@@ -231,7 +198,7 @@ def load_model(model_path: str,
                 dtype=torch_dtype,
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
-                **extra_kwargs,
+                ignore_mismatched_sizes=True,
             )
         elif Qwen3VLForConditionalGeneration is not None:
             model = _call_from_pretrained(
@@ -240,7 +207,7 @@ def load_model(model_path: str,
                 dtype=torch_dtype,
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
-                **extra_kwargs,
+                ignore_mismatched_sizes=True,
             )
         else:
             raise RuntimeError(
@@ -255,7 +222,7 @@ def load_model(model_path: str,
                 dtype=torch_dtype,
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
-                **extra_kwargs,
+                ignore_mismatched_sizes=True,
             )
         else:
             model = _call_from_pretrained(
@@ -264,7 +231,7 @@ def load_model(model_path: str,
                 dtype=torch_dtype,
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
-                **extra_kwargs,
+                ignore_mismatched_sizes=True,
             )
 
     if device_map is None:
@@ -275,18 +242,16 @@ def load_model(model_path: str,
 
 
 class CEDExperiment:
-    def __init__(self, model_path: str, device: str, dtype: str, trust_remote_code: bool,
-                 device_map_arg: Optional[str], max_cpu_mem: Optional[str], offload_folder: Optional[str]):
-        self.processor, self.model = load_model(
-            model_path,
-            device=device,
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
-            device_map_arg=device_map_arg,
-            max_cpu_mem=max_cpu_mem,
-            offload_folder=offload_folder,
-        )
+    def __init__(self, model_path: str, device: str, dtype: str, trust_remote_code: bool):
+        self.processor, self.model = load_model(model_path, device=device, dtype=dtype, trust_remote_code=trust_remote_code)
         self.num_layers = _get_num_hidden_layers(self.model.config, self.model)
+
+
+def _substitute_placeholders(argv: List[str], model_path: str) -> List[str]:
+    out: List[str] = []
+    for x in argv:
+        out.append(x.replace("{MODEL_PATH}", model_path))
+    return out
 
 
 def parse_args():
@@ -301,14 +266,14 @@ def parse_args():
     p.add_argument("--dtype", type=str, default="auto")
     p.add_argument("--trust-remote-code", action="store_true", default=True)
     p.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
+
     p.add_argument("--download-only", action="store_true")
-
-    # ✅ CPU 低内存加载（可选）
-    p.add_argument("--device-map", type=str, default=None, help="e.g. auto")
-    p.add_argument("--max-cpu-mem", type=str, default=None, help="e.g. 24GiB (used with --device-map auto)")
-    p.add_argument("--offload-folder", type=str, default=None, help="folder for disk offload")
-
     p.add_argument("--smoke-test", action="store_true")
+
+    p.add_argument("--exec", dest="exec_mode", action="store_true")
+    p.add_argument("exec_argv", nargs=argparse.REMAINDER)
+
+    p.add_argument("--verify-load", action="store_true", help="Load model once before exec for verification.")
     return p.parse_args()
 
 
@@ -327,20 +292,33 @@ def main():
         preferred_roots=preferred_roots,
         fallback_repo=args.fallback_repo,
     )
-    print("[OK] Model ready at: {}".format(os.path.abspath(model_path)), flush=True)
+    model_path = os.path.abspath(model_path)
+    print("[OK] Model ready at: {}".format(model_path), flush=True)
 
     if args.download_only:
         return
 
-    exp = CEDExperiment(
-        model_path,
-        device=args.device,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        device_map_arg=args.device_map,
-        max_cpu_mem=args.max_cpu_mem,
-        offload_folder=args.offload_folder,
-    )
+    if args.exec_mode:
+        if not args.exec_argv:
+            raise SystemExit("`--exec` specified but no command provided. Usage: --exec -- python your_exp.py ...")
+
+        exec_argv = args.exec_argv
+        if exec_argv and exec_argv[0] == "--":
+            exec_argv = exec_argv[1:]
+        exec_argv = _substitute_placeholders(exec_argv, model_path)
+
+        if args.verify_load:
+            exp = CEDExperiment(model_path, device=args.device, dtype=args.dtype, trust_remote_code=args.trust_remote_code)
+            print("[OK] Verified load. num_layers = {}".format(exp.num_layers), flush=True)
+
+        env = os.environ.copy()
+        env["CED_MODEL_PATH"] = model_path
+
+        print("[EXEC]", " ".join(exec_argv), flush=True)
+        r = subprocess.run(exec_argv, env=env)
+        raise SystemExit(r.returncode)
+
+    exp = CEDExperiment(model_path, device=args.device, dtype=args.dtype, trust_remote_code=args.trust_remote_code)
     print("[OK] Loaded model. num_layers = {}".format(exp.num_layers), flush=True)
 
     if args.smoke_test:

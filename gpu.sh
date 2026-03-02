@@ -1,12 +1,12 @@
-    #!/usr/bin/env bash
-    set -euo pipefail
+#!/usr/bin/env bash
+set -euo pipefail
 
-    CED_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0"
-    PY="$CED_ENV/bin/python"
-    if [ ! -x "$PY" ]; then
-      echo "[FATAL] Python not found: $PY" >&2
-      exit 1
-    fi
+CED_ENV="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-nlp-sh02/native_mm/zhangmanyuan/zhangquan/agent/xl/hhj-train/dataprepare/conda_envs/ced_p0"
+PY="$CED_ENV/bin/python"
+if [ ! -x "$PY" ]; then
+  echo "[FATAL] Python not found: $PY" >&2
+  exit 1
+fi
 
 
 add_lib_dir () {
@@ -26,20 +26,34 @@ add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 add_lib_dir "$CED_ENV/lib/python3.10/site-packages/nvidia/cuda_nvrtc/lib"
 
 
-    export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
-    export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
-    export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_HOME="${HF_HOME:-$PWD/.hf_home}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 
-    MODEL_ID="${MODEL_ID:-auto}"
-    LOCAL_DIR="${LOCAL_DIR:-$PWD/../dataprepare/models/Qwen3-VL-8B-Instruct}"
-    CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
-    FALLBACK_REPO="${FALLBACK_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
+MODEL_ID="${MODEL_ID:-auto}"
+LOCAL_DIR="${LOCAL_DIR:-$PWD/../dataprepare/models/Qwen3-VL-8B-Instruct}"
+CACHE_DIR="${CACHE_DIR:-$HF_HUB_CACHE}"
+FALLBACK_REPO="${FALLBACK_REPO:-Qwen/Qwen3-VL-8B-Instruct}"
 
-    "$PY" -u main.py \
-      --repo-id "$MODEL_ID" \
-      --local-dir "$LOCAL_DIR" \
-      --cache-dir "$CACHE_DIR" \
-      --fallback-repo "$FALLBACK_REPO" \
-      --device cuda:0 \
-      --dtype auto \
-      --smoke-test
+# ✅ v9：如果你在 gpu.sh 后面跟了命令，就执行实验命令（支持 {MODEL_PATH} 占位符）：
+#   bash gpu.sh python your_experiment.py --model_path {MODEL_PATH} --device cuda:0
+if [ "$#" -gt 0 ]; then
+  "$PY" -u main.py \
+    --repo-id "$MODEL_ID" \
+    --local-dir "$LOCAL_DIR" \
+    --cache-dir "$CACHE_DIR" \
+    --fallback-repo "$FALLBACK_REPO" \
+    --device cuda:0 \
+    --dtype auto \
+    --exec -- "$@"
+  exit 0
+fi
+
+"$PY" -u main.py \
+  --repo-id "$MODEL_ID" \
+  --local-dir "$LOCAL_DIR" \
+  --cache-dir "$CACHE_DIR" \
+  --fallback-repo "$FALLBACK_REPO" \
+  --device cuda:0 \
+  --dtype auto \
+  --smoke-test
