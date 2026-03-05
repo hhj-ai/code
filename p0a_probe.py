@@ -1,347 +1,118 @@
-"""p0a_probe.py — P0-a 架构探测。
+"""P0-a 架构探测：确认 grid/hook/映射/替换 全部可工作，否则直接报错。"""
 
-目的（一天内完成，单卡）：
-1. 确认 Qwen3-VL 的 visual token 结构（grid_h, grid_w, total_tokens）
-2. 确认 2×2 merger 的降采样比例
-3. 确认 hook 能正常截获 hidden states
-4. 确认 token 替换后 output 确实发生变化
-5. 用一张 COCO 图做端到端 CED 计算验证
-
-如果这一步失败，后续全部不用做。
-"""
-
-from __future__ import annotations
-import argparse
-import json
-import os
-import sys
+import argparse, json, os, sys
 from pathlib import Path
 
 import torch
 from PIL import Image
 
-# 添加 src 到 path
 sys.path.insert(0, str(Path(__file__).parent))
-
-from model_loader import load_qwen3vl, get_num_layers
-from visual_token_map import (
-    get_visual_token_grid,
-    bbox_to_merged_token_indices,
-    get_surrounding_token_indices,
-    find_visual_token_range_in_input_ids,
-    visual_token_absolute_positions,
-)
-from ced_core import (
-    CEDComputer,
-    prepare_inputs,
-    get_image_token_id,
-    HiddenStateCapture,
-)
-
-
-def probe_visual_encoder(model, processor, image, device, report):
-    """探测 visual encoder 的输出结构。"""
-    print("\n=== Probe 1: Visual Encoder Structure ===")
-
-    # 准备一个简单输入
-    messages = [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": "Describe this image."},
-    ]}]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
-    inputs.pop("token_type_ids", None)
-
-    # 检查 image_grid_thw
-    if "image_grid_thw" in inputs:
-        grid_thw = inputs["image_grid_thw"]
-        t, h, w = grid_thw[0].tolist() if grid_thw.dim() > 1 else grid_thw.tolist()
-        report["image_grid_thw"] = [int(t), int(h), int(w)]
-        report["total_merged_tokens"] = int(t * h * w)
-        print(f"  image_grid_thw: t={int(t)}, h={int(h)}, w={int(w)}")
-        print(f"  total merged visual tokens: {int(t * h * w)}")
-    else:
-        report["image_grid_thw"] = None
-        print("  [WARN] No image_grid_thw in processor output")
-
-    # 检查 pixel_values shape
-    if "pixel_values" in inputs:
-        pv_shape = list(inputs["pixel_values"].shape)
-        report["pixel_values_shape"] = pv_shape
-        print(f"  pixel_values shape: {pv_shape}")
-    else:
-        report["pixel_values_shape"] = None
-
-    # 检查 input_ids 中的 image token
-    input_ids = inputs["input_ids"]
-    report["input_ids_length"] = input_ids.shape[-1]
-
-    try:
-        img_token_id = get_image_token_id(processor)
-        report["image_token_id"] = img_token_id
-
-        # 找 visual token 范围
-        vis_start, vis_end = find_visual_token_range_in_input_ids(input_ids, img_token_id)
-        n_visual = vis_end - vis_start
-        report["visual_token_range"] = [vis_start, vis_end]
-        report["n_visual_tokens_in_sequence"] = n_visual
-        print(f"  image_token_id: {img_token_id}")
-        print(f"  visual tokens in input_ids: [{vis_start}, {vis_end}) = {n_visual} tokens")
-
-        # 验证：merged tokens 数 == input_ids 中的 visual token 数
-        if "image_grid_thw" in inputs:
-            expected = int(t * h * w)
-            match = n_visual == expected
-            report["grid_matches_sequence"] = match
-            if match:
-                print(f"  ✓ Grid ({expected}) matches sequence ({n_visual})")
-            else:
-                print(f"  ✗ Grid ({expected}) != sequence ({n_visual})")
-    except Exception as e:
-        report["image_token_id_error"] = str(e)
-        print(f"  [ERROR] {e}")
-
-    return inputs
-
-
-def probe_hooks(model, inputs, device, report):
-    """探测 hook 是否能正常工作。"""
-    print("\n=== Probe 2: Hook Mechanism ===")
-
-    inputs_gpu = {k: v.to(device) for k, v in inputs.items()}
-    num_layers = report.get("num_layers", 32)
-
-    test_layers = [0, num_layers // 4, num_layers // 2, 3 * num_layers // 4, num_layers - 1]
-    test_layers = [l for l in test_layers if l < num_layers]
-
-    capture = HiddenStateCapture()
-    try:
-        capture.register(model, test_layers)
-        with torch.no_grad():
-            model(**inputs_gpu)
-
-        captured_layers = sorted(capture.captured.keys())
-        report["hook_captured_layers"] = captured_layers
-        report["hook_works"] = len(captured_layers) == len(test_layers)
-
-        for layer_idx in captured_layers:
-            hs = capture.captured[layer_idx]
-            print(f"  Layer {layer_idx}: shape={list(hs.shape)}, dtype={hs.dtype}")
-
-        if captured_layers:
-            report["hidden_dim"] = capture.captured[captured_layers[0]].shape[-1]
-            print(f"  ✓ Hook mechanism works. Hidden dim = {report['hidden_dim']}")
-        else:
-            print("  ✗ No layers captured!")
-
-    except Exception as e:
-        report["hook_error"] = str(e)
-        print(f"  [ERROR] Hook failed: {e}")
-    finally:
-        capture.remove_hooks()
-
-
-def probe_token_replacement(model, processor, image, device, report):
-    """探测 token 替换后 output 是否变化。"""
-    print("\n=== Probe 3: Token Replacement Effect ===")
-
-    # 准备输入
-    messages = [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": "What objects are in this image?"},
-    ]}]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
-    inputs.pop("token_type_ids", None)
-    inputs_gpu = {k: v.to(device) for k, v in inputs.items()}
-
-    try:
-        img_token_id = get_image_token_id(processor)
-        vis_start, vis_end = find_visual_token_range_in_input_ids(
-            inputs["input_ids"], img_token_id
-        )
-        n_visual = vis_end - vis_start
-
-        if n_visual < 4:
-            report["replacement_error"] = f"Too few visual tokens: {n_visual}"
-            print(f"  [ERROR] Too few visual tokens: {n_visual}")
-            return
-
-        # 目标：中心区域（模拟一个物体占据的位置）
-        mid = n_visual // 2
-        quarter = max(1, n_visual // 8)
-        target_rel = list(range(mid - quarter, mid + quarter))
-        surround_rel = [i for i in range(n_visual) if i not in set(target_rel)]
-        surround_rel = surround_rel[:len(target_rel) * 4]  # 限制周围 token 数
-
-        target_abs = [vis_start + i for i in target_rel]
-        surround_abs = [vis_start + i for i in surround_rel]
-
-        report["test_target_tokens"] = len(target_abs)
-        report["test_surround_tokens"] = len(surround_abs)
-
-        # 正常前向
-        with torch.no_grad():
-            out_orig = model(**inputs_gpu)
-        logits_orig = out_orig.logits[:, -1, :].float()
-        probs_orig = torch.softmax(logits_orig, dim=-1)
-
-        # 替换后前向
-        from ced_core import VisualTokenReplacer, replacement_context
-        replacer = VisualTokenReplacer()
-        replacer.register(model)
-        replacer.set_replacement(target_abs, surround_abs)
-
-        with torch.no_grad():
-            with replacement_context(replacer):
-                out_replaced = model(**inputs_gpu)
-        logits_replaced = out_replaced.logits[:, -1, :].float()
-        probs_replaced = torch.softmax(logits_replaced, dim=-1)
-
-        replacer.remove_hook()
-
-        # 计算差异
-        from ced_core import js_divergence, entropy, cosine_distance
-
-        js = js_divergence(probs_orig, probs_replaced).item()
-        h_orig = entropy(probs_orig).item()
-        h_replaced = entropy(probs_replaced).item()
-        cos = cosine_distance(logits_orig, logits_replaced).item()
-
-        report["replacement_js"] = js
-        report["replacement_entropy_orig"] = h_orig
-        report["replacement_entropy_replaced"] = h_replaced
-        report["replacement_cosine_dist"] = cos
-        report["replacement_works"] = js > 1e-6  # 替换后有变化
-
-        print(f"  JS divergence:    {js:.6f}")
-        print(f"  Entropy (orig):   {h_orig:.4f}")
-        print(f"  Entropy (repl):   {h_replaced:.4f}")
-        print(f"  Cosine distance:  {cos:.6f}")
-
-        if js > 1e-6:
-            print("  ✓ Token replacement produces measurable output change")
-        else:
-            print("  ✗ Token replacement has NO effect (problem!)")
-
-    except Exception as e:
-        report["replacement_error"] = str(e)
-        print(f"  [ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def probe_bbox_mapping(image, processor, report):
-    """探测 bbox → token index 映射。"""
-    print("\n=== Probe 4: BBox → Token Index Mapping ===")
-
-    grid_thw = report.get("image_grid_thw")
-    if not grid_thw:
-        print("  [SKIP] No grid info available")
-        return
-
-    t, grid_h, grid_w = grid_thw
-    w, h = image.size  # PIL: (width, height)
-
-    # 测试几个 bbox
-    test_bboxes = [
-        ("center", [w * 0.25, h * 0.25, w * 0.5, h * 0.5]),
-        ("top-left", [0, 0, w * 0.3, h * 0.3]),
-        ("bottom-right", [w * 0.7, h * 0.7, w * 0.3, h * 0.3]),
-        ("small-center", [w * 0.4, h * 0.4, w * 0.2, h * 0.2]),
-    ]
-
-    mapping_results = []
-    for name, bbox in test_bboxes:
-        indices = bbox_to_merged_token_indices(bbox, w, h, grid_h, grid_w)
-        surround = get_surrounding_token_indices(indices, grid_h, grid_w)
-        ratio = len(indices) / (grid_h * grid_w) if grid_h * grid_w > 0 else 0
-
-        result = {
-            "name": name,
-            "bbox": bbox,
-            "n_target_tokens": len(indices),
-            "n_surround_tokens": len(surround),
-            "coverage_ratio": round(ratio, 3),
-        }
-        mapping_results.append(result)
-        print(f"  {name}: {len(indices)} target tokens, {len(surround)} surround, "
-              f"coverage={ratio:.1%}")
-
-    report["bbox_mapping_tests"] = mapping_results
-    report["bbox_mapping_works"] = all(r["n_target_tokens"] > 0 for r in mapping_results)
+from model_loader import load, num_layers
+from visual_token_map import bbox_to_token_indices, surrounding_indices, find_visual_range
+from ced_core import HiddenCapture, TokenReplacer, replacing, js_div, ent, get_image_token_id
 
 
 def main():
-    parser = argparse.ArgumentParser(description="P0-a: Architecture Probe")
-    parser.add_argument("--model_dir", type=str, required=True)
-    parser.add_argument("--coco_dir", type=str, required=True)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--output", type=str, default="results/p0a_probe_report.json")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_dir", required=True)
+    ap.add_argument("--coco_dir", required=True)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--output", default="results/p0a_probe_report.json")
+    args = ap.parse_args()
 
-    report = {"status": "running", "probes": {}}
+    rpt = {}
 
-    # ---- 加载模型 ----
-    print("=== Loading Model ===")
-    processor, model, cfg = load_qwen3vl(args.model_dir, args.device, args.dtype)
-    num_layers = get_num_layers(cfg, model)
-    report["model_dir"] = args.model_dir
-    report["num_layers"] = num_layers
-    report["model_type"] = getattr(cfg, "model_type", "unknown")
-    print(f"  Model loaded. num_layers={num_layers}, type={report['model_type']}")
+    # 加载模型
+    print("=== 加载模型 ===")
+    processor, model, cfg = load(args.model_dir, args.device, args.dtype)
+    nl = num_layers(cfg, model)
+    rpt["num_layers"] = nl
+    print(f"  num_layers={nl}")
 
-    # ---- 找一张 COCO 图 ----
-    coco_img_dir = os.path.join(args.coco_dir, "val2017")
-    if not os.path.isdir(coco_img_dir):
-        # 如果 coco_dir 直接就是图片目录
-        coco_img_dir = args.coco_dir
+    # 找测试图
+    img_dir = f"{args.coco_dir}/val2017"
+    jpgs = sorted(f for f in os.listdir(img_dir) if f.endswith(".jpg"))
+    assert jpgs, f"没有jpg: {img_dir}"
+    image = Image.open(f"{img_dir}/{jpgs[0]}").convert("RGB")
+    w, h = image.size
+    print(f"  测试图: {jpgs[0]} ({w}×{h})")
 
-    jpg_files = sorted([f for f in os.listdir(coco_img_dir) if f.endswith(".jpg")])
-    if not jpg_files:
-        print(f"[FATAL] No jpg files in {coco_img_dir}")
-        report["status"] = "failed"
-        report["error"] = "no_images"
-    else:
-        img_path = os.path.join(coco_img_dir, jpg_files[0])
-        image = Image.open(img_path).convert("RGB")
-        print(f"  Test image: {jpg_files[0]} ({image.size[0]}×{image.size[1]})")
-        report["test_image"] = jpg_files[0]
-        report["test_image_size"] = list(image.size)
+    # ── Probe 1: Visual Encoder 结构 ──
+    print("\n=== Probe 1: Grid 结构 ===")
+    msgs = [{"role": "user", "content": [
+        {"type": "image", "image": image}, {"type": "text", "text": "Describe."}]}]
+    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
+    inputs.pop("token_type_ids", None)
 
-        # ---- 运行各项探测 ----
-        inputs = probe_visual_encoder(model, processor, image, args.device, report)
-        probe_hooks(model, inputs, args.device, report)
-        probe_bbox_mapping(image, processor, report)
-        probe_token_replacement(model, processor, image, args.device, report)
+    assert "image_grid_thw" in inputs, "processor 输出里没有 image_grid_thw"
+    g = inputs["image_grid_thw"]
+    t, gh, gw = (g[0].tolist() if g.dim() > 1 else g.tolist())
+    gh, gw = int(gh), int(gw)
+    rpt["grid"] = [int(t), gh, gw]
+    print(f"  grid: t={int(t)} h={gh} w={gw} total={int(t*gh*gw)}")
 
-        # ---- 汇总 ----
-        all_ok = (
-            report.get("hook_works", False)
-            and report.get("replacement_works", False)
-            and report.get("bbox_mapping_works", False)
-            and report.get("grid_matches_sequence", False)
-        )
-        report["status"] = "passed" if all_ok else "partial"
-        report["all_probes_passed"] = all_ok
+    img_tid = get_image_token_id(processor)
+    vs, ve = find_visual_range(inputs["input_ids"], img_tid)
+    n_vis = ve - vs
+    rpt["n_visual_tokens"] = n_vis
+    print(f"  image_token_id={img_tid}, visual tokens [{vs},{ve}) = {n_vis}")
+    assert n_vis == int(t * gh * gw), f"grid({int(t*gh*gw)}) != sequence({n_vis})"
+    print("  ✓ grid 匹配 sequence")
 
-    # ---- 输出 ----
+    # ── Probe 2: Hook ──
+    print("\n=== Probe 2: Hook ===")
+    test_layers = [0, nl//2, nl-1]
+    inputs_gpu = {k: v.to(args.device) for k, v in inputs.items()}
+    cap = HiddenCapture()
+    cap.register(model, test_layers)
+    with torch.no_grad(): model(**inputs_gpu)
+    assert len(cap.data) == len(test_layers), f"hook 只捕获了 {len(cap.data)}/{len(test_layers)} 层"
+    rpt["hidden_dim"] = cap.data[test_layers[0]].shape[-1]
+    print(f"  ✓ 捕获 {len(cap.data)} 层, hidden_dim={rpt['hidden_dim']}")
+    cap.remove()
+
+    # ── Probe 3: BBox 映射 ──
+    print("\n=== Probe 3: BBox 映射 ===")
+    for name, bbox in [("center", [w*.25, h*.25, w*.5, h*.5]),
+                        ("small", [w*.4, h*.4, w*.2, h*.2])]:
+        idx = bbox_to_token_indices(bbox, w, h, gh, gw)
+        sur = surrounding_indices(idx, gh, gw)
+        assert idx, f"{name}: target tokens 为空"
+        print(f"  {name}: target={len(idx)} surround={len(sur)}")
+    print("  ✓ 映射正常")
+
+    # ── Probe 4: Token 替换效果 ──
+    print("\n=== Probe 4: 替换效果 ===")
+    mid = n_vis // 2; q = max(1, n_vis // 8)
+    tgt_rel = list(range(mid-q, mid+q))
+    sur_rel = [i for i in range(n_vis) if i not in set(tgt_rel)][:len(tgt_rel)*4]
+    tgt_abs = [vs + i for i in tgt_rel]
+    sur_abs = [vs + i for i in sur_rel]
+
+    with torch.no_grad():
+        p1 = torch.softmax(model(**inputs_gpu).logits[:, -1, :].float(), -1)
+
+    rep = TokenReplacer(); rep.register(model); rep.set(tgt_abs, sur_abs)
+    with torch.no_grad(), replacing(rep):
+        p2 = torch.softmax(model(**inputs_gpu).logits[:, -1, :].float(), -1)
+    rep.remove()
+
+    js = js_div(p1, p2).item()
+    rpt["replacement_js"] = js
+    assert js > 1e-6, f"替换后 JS={js}，太小，替换无效"
+    print(f"  JS={js:.6f}  H_orig={ent(p1).item():.4f}  H_repl={ent(p2).item():.4f}")
+    print("  ✓ 替换有效")
+
+    # 保存
+    rpt["status"] = "passed"
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-
-    print(f"\n{'=' * 50}")
-    print(f"  P0-a Result: {'✓ ALL PASSED' if report.get('all_probes_passed') else '✗ SOME FAILED'}")
-    print(f"  Report: {args.output}")
-    print(f"{'=' * 50}")
-
-    if not report.get("all_probes_passed"):
-        # 打印失败的项
-        for key in ["hook_works", "replacement_works", "bbox_mapping_works", "grid_matches_sequence"]:
-            val = report.get(key)
-            if val is not True:
-                print(f"  ✗ {key} = {val}")
+    json.dump(rpt, open(args.output, "w"), indent=2)
+    print(f"\n{'='*50}")
+    print(f"  P0-a ✓ 全部通过")
+    print(f"  报告: {args.output}")
+    print(f"{'='*50}")
 
 
 if __name__ == "__main__":
